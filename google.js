@@ -6,8 +6,9 @@
   const API = 'https://www.googleapis.com/calendar/v3';
   const messages = {
     auth: '로그인이 끝나 멈춤',
-    popup_closed: "구글 로그인 창이 닫혔습니다. 다시 눌러 주세요. 구글이 '액세스 차단'이라고 했다면 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.",
-    denied: '구글 로그인이 허락되지 않았습니다. 권한 화면에서 허용하지 않았거나, 이 웹을 쓸 수 있는 사람(테스트 사용자)으로 아직 넣지 않은 계정입니다. 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.',
+    // whom to ask: the person who told you about this web, not an 'operator' you do not know (SOP-014 C round 2)
+    popup_closed: "구글 로그인 창이 닫혔습니다. 다시 눌러 주세요. 구글이 '액세스 차단'이라고 했다면 이 웹을 알려 준 사람에게 내 구글 이메일을 알려 테스트 사용자로 넣어 달라고 하세요.",
+    denied: '구글 로그인이 허락되지 않았습니다. 권한 화면에서 허용하지 않았거나, 이 웹을 쓸 수 있는 사람(테스트 사용자)으로 아직 넣지 않은 계정입니다. 이 웹을 알려 준 사람에게 내 구글 이메일을 알려 테스트 사용자로 넣어 달라고 하세요.',
     popup_failed: '팝업이 막혔습니다. 이 사이트의 팝업을 허용한 뒤 다시 눌러 주세요.',
     scope: '구글 권한 화면에서 캘린더 일정을 보고 수정하는 항목을 허용하지 않아 넣을 수 없습니다.',
     forbidden: '구글이 거절했습니다(권한 없음). 이 달력에 일정을 넣을 수 있는 권한인지 확인하고, 로그아웃한 뒤 다시 로그인해 주세요.',
@@ -20,7 +21,8 @@
   const error = (code, message) => Object.assign(new Error(message || messages[code]), { code });
   window.GoogleCalendar = { create({ clientId, fetchImpl = window.fetch.bind(window) }) {
     const configured = !!clientId;
-    let token = '', expires = 0, listGranted = false, loading, client, pending;
+    // generation goes up with every token, so callers can drop answers that belong to an earlier sign-in (P-011)
+    let token = '', expires = 0, listGranted = false, generation = 0, loading, client, pending;
     function clear() { token = ''; expires = 0; listGranted = false; }
     function isSignedIn() { if (Date.now() >= expires) clear(); return !!token; }
     function init() {
@@ -36,7 +38,7 @@
           // the events permission is required; the list permission may be left unticked (checked one by one)
           if (!oauth.hasGrantedAllScopes(resp, SCOPE_EVENTS)) { if (!p.keep) clear(); p.reject(error('scope')); return; }
           token = resp.access_token; expires = Date.now() + Math.max(0, Number(resp.expires_in) - 60) * 1000;
-          listGranted = oauth.hasGrantedAllScopes(resp, SCOPE_LIST);
+          listGranted = oauth.hasGrantedAllScopes(resp, SCOPE_LIST); generation++;
           p.resolve();
         },
         error_callback(resp) {
@@ -61,13 +63,15 @@
     }
     async function request(url, options = {}) {
       if (!isSignedIn()) throw error('auth');
+      const used = token;
       let res, body;
       try {
-        res = await fetchImpl(url, { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } });
+        res = await fetchImpl(url, { ...options, headers: { ...options.headers, Authorization: `Bearer ${used}` } });
       } catch (_) {
         throw error('network', options.method === 'POST' ? "응답을 받지 못했습니다(들어갔는지 확인 못 함). '실패한 것만 다시'를 누르면 이미 들어간 것은 건너뜁니다." : undefined);
       }
-      if (res.status === 401) { clear(); throw error('auth'); }
+      // a 401 for an older token must not sign out a newer one (P-011 Codex review 1)
+      if (res.status === 401) { if (token === used) clear(); throw error('auth'); }
       try { body = await res.json(); } catch (_) { body = {}; }
       if (res.status === 403) {
         const reasons = body?.error?.errors || [];
@@ -112,6 +116,31 @@
       }
       throw error('server');  // more pages than any real list: show none rather than part of it
     }
+    // events.list of one calendar between two instants, every page (P-011). calendar.events is enough to read.
+    // complete: false when more pages remain than the app reads, so a part is never shown as the whole month.
+    async function listEvents(calendarId, timeMin, timeMax) {
+      const base = `${API}/calendars/${encodeURIComponent(calendarId || 'primary')}/events`;
+      const items = [];
+      let pageToken = '';
+      for (let page = 0; page < 20; page++) {
+        const query = new URLSearchParams({ timeMin, timeMax, singleEvents: 'true', orderBy: 'startTime', maxResults: '250' });
+        if (pageToken) query.set('pageToken', pageToken);
+        const r = await request(`${base}?${query}`);
+        if (r.status === 404) throw error('calendar');
+        if (r.status !== 200) throw error('server');
+        if (Array.isArray(r.body.items)) items.push(...r.body.items);
+        pageToken = r.body.nextPageToken || '';
+        if (!pageToken) return { items, complete: true };
+      }
+      return { items, complete: false };
+    }
+    // events.delete of one event this app added in the current run ('방금 넣은 일정 지우기', SOP-014 evaluators).
+    // Already gone (404, 410) counts as gone.
+    async function deleteEvent(calendarId, eventId) {
+      const r = await request(`${API}/calendars/${encodeURIComponent(calendarId || 'primary')}/events/${encodeURIComponent(eventId)}`, { method: 'DELETE' });
+      if ([200, 204, 404, 410].includes(r.status)) return;
+      throw error('server');
+    }
     // target: { calendarId, ownerKey }, fixed for the whole run. The primary calendar keeps the P-002 ids (D-007).
     async function insertIfMissing(evt, target = {}) {
       const calendarId = target.calendarId || 'primary', owner = calendarId === 'primary' ? '' : target.ownerKey;
@@ -142,6 +171,6 @@
         catch (_) { clear(); resolve(); }
       });
     }
-    return { configured, preload, signIn, isSignedIn, signOut, listCalendars, insertIfMissing };
+    return { configured, preload, signIn, isSignedIn, signOut, listCalendars, listEvents, insertIfMissing, deleteEvent, generation: () => generation };
   } };
 })();

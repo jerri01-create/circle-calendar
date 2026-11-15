@@ -33,6 +33,16 @@
     <p class="muted">사진은 이 기기 안에서만 읽고 어디에도 보내지 않습니다.</p>
     <p id="status" role="status" aria-live="polite"></p>
   </section>
+  <section id="calendar-pick" aria-labelledby="pick-heading" hidden>
+    <h2 id="pick-heading">넣고 볼 달력</h2>
+    <div id="calendar-field">
+      <label for="calendar-select">달력 (아래 '내 달력'에도 이 달력이 보입니다)</label>
+      <select id="calendar-select" aria-describedby="calendar-note"></select>
+      <p id="calendar-note" class="muted" aria-live="polite"></p>
+      <button id="calendar-allow" type="button" hidden>다른 달력도 고르기</button>
+      <button id="calendar-reload" type="button" hidden>달력 목록 다시 읽기</button>
+    </div>
+  </section>
   <section id="step-check" hidden>
     <h2 id="check-title" tabindex="-1">2. 찾은 날짜 확인</h2>
     <p id="result-summary"></p><p id="month-note"></p><div id="month-candidates" hidden></div>
@@ -55,17 +65,60 @@
   </section>
   <section id="step-add" hidden>
     <h2>4. 구글 달력에 넣기</h2>
-    <div id="calendar-field" hidden>
-      <label for="calendar-select">넣을 달력</label>
-      <select id="calendar-select" aria-describedby="calendar-note"></select>
-      <p id="calendar-note" class="muted" aria-live="polite"></p>
-      <button id="calendar-allow" type="button" hidden>다른 달력도 고르기</button>
-    </div>
     <ul id="preview-list"></ul><ul id="add-results"></ul><p id="add-error" class="error" role="alert" hidden></p>
     <button class="primary" id="add-button" type="button"></button><p id="test-add-note" class="muted" hidden></p><p id="empty-note" hidden>넣을 날짜가 없습니다. 위 달력에서 날짜를 골라 주세요.</p>
+    <a id="target-change" href="#calendar-pick" hidden>넣을 달력 바꾸기 (위 '넣고 볼 달력')</a>
     <p id="progress" role="status" aria-live="polite"></p><p id="add-summary" role="status"></p>
     <button id="retry-failed" type="button" hidden>실패한 것만 다시</button>
+    <button id="undo-run" type="button" hidden></button>
+    <div id="undo-box" class="notice" hidden>
+      <p id="undo-text"></p>
+      <button id="undo-confirm" class="danger" type="button">지우기</button>
+      <button id="undo-cancel" type="button">그만두기</button>
+    </div>
     <a id="open-calendar" target="_blank" rel="noopener noreferrer" hidden>구글 달력에서 보기 (새 창)</a>
+  </section>
+  <section id="my-calendar" data-state="signed-out" aria-labelledby="view-heading" hidden>
+    <h2 id="view-heading">내 달력</h2>
+    <div class="view-nav"><button id="view-prev" type="button">‹ 이전 달</button><p id="view-title" aria-live="polite"></p><button id="view-next" type="button">다음 달 ›</button></div>
+    <button id="view-today" type="button">오늘이 있는 달로</button>
+    <p id="view-note" role="status" hidden></p>
+    <button id="view-retry" type="button" hidden>다시 읽기</button>
+    <div id="view-grid" role="group" aria-label="이 달의 날짜와 일정 수"></div>
+    <p id="view-legend" class="muted">점은 그날의 일정이고 색은 구글 달력의 일정 색입니다. 날짜를 누르면 그날 일정만 봅니다. 일정 하나를 고치거나 지우려면 목록에서 '열기'를 눌러 구글 달력에서 합니다.</p>
+    <p id="view-day-title" aria-live="polite" hidden></p>
+    <button id="view-all" type="button" hidden>이 달 일정 전체 보기</button>
+    <ol id="view-list" aria-label="이 달 일정"></ol>
+    <a id="view-open" target="_blank" rel="noopener noreferrer">구글 달력에서 보기 (새 창)</a>
+  </section>
+  <section id="together">
+    <h2>같이 쓰기</h2>
+    <button id="share-app" type="button">이 앱 주소 보내기</button>
+    <div id="share-note" role="status" hidden></div>
+    <div id="invite" hidden>
+      <h3>같이 쓸 사람 부르기</h3>
+      <div id="invite-steps">
+        <h4>내가 할 일</h4>
+        <ol>
+          <li>같이 쓸 달력을 위 '넣고 볼 달력'에서 고르거나, 아래 '새 공유 달력 만들기'로 만듭니다.</li>
+          <li>그 달력의 공유 설정에서 가족의 구글 이메일을 넣고 권한을 '변경 및 일정 세부정보 보기'로 고릅니다.</li>
+          <li>이 웹은 아직 시험 운영 중이라 아무나 로그인할 수 없습니다. 이 웹을 만든 사람에게 가족의 구글 이메일을 알려 사용자로 넣어 달라고 하세요(테스트 사용자 등록).</li>
+          <li>아래 '초대 메시지 보내기'로 가족에게 할 일을 보냅니다.</li>
+        </ol>
+        <h4>가족이 할 일</h4>
+        <ol>
+          <li>받은 초대 메일에서 그 달력을 자기 캘린더 목록에 추가합니다.</li>
+          <li>이 웹에서 구글 로그인을 누르고, 권한 화면에서 캘린더 목록 보기 항목도 허용합니다.</li>
+          <li>'넣고 볼 달력'에서 그 달력을 고릅니다.</li>
+        </ol>
+      </div>
+      <a id="invite-settings" target="_blank" rel="noopener noreferrer"></a>
+      <p id="invite-settings-note" class="muted" hidden></p>
+      <p id="invite-owner-note" class="notice" hidden></p>
+      <a id="invite-create" href="https://calendar.google.com/calendar/r/settings/createcalendar" target="_blank" rel="noopener noreferrer">새 공유 달력 만들기 (새 창)</a>
+      <button id="invite-message" type="button">초대 메시지 보내기</button>
+      <div id="invite-note" role="status" hidden></div>
+    </div>
   </section>
 </main>
 </body>

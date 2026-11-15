@@ -15,6 +15,13 @@
   // P-009 calendar choice: calendars = writable calendars from the list (null = not read), ownerKey = person key
   // ('' = account unknown), batch = the target fixed when a run starts, runError = the reason shown by the button
   let calendars = null, ownerKey = '', chosen = 'primary', calendarNote = '', listGranted = false, batch = null, runError = '', runInfo = false, shownOptions = '';
+  // P-011 my calendar: the month shown and its events, the ids the last run added or found, and the primary
+  // calendar's real id and colour (kept in memory only; the device stores the person key and the choice as before)
+  let view = { year: 0, month: 0, items: [], state: 'signed-out', note: '로그인하면 내 달력이 보입니다.', seq: 0, picked: 0 }, justAdded = { calendarId: '', ids: new Set() };
+  let undoOpen = false;  // the '방금 넣은 일정 지우기' confirmation is showing
+  let primaryId = '', primaryColor = '', viewDue = false;
+  // Google Calendar's eleven event colours as the web shows them (colorId -> colour)
+  const PALETTE = { 1: '#7986cb', 2: '#33b679', 3: '#8e24aa', 4: '#e67c73', 5: '#f6bf26', 6: '#f4511e', 7: '#039be5', 8: '#616161', 9: '#3f51b5', 10: '#0b8043', 11: '#d50000' };
   // the permission message says which button brings the permission screen back, by the button that was pressed
   const AGAIN = { add: ' 넣기 단추를 다시 누르면 권한 화면이 다시 나오니, 그 항목에 체크해 주세요.',
     login: ' 구글 로그인을 다시 누르면 권한 화면이 다시 나오니, 그 항목에 체크해 주세요.' };
@@ -44,7 +51,7 @@
     $('test-mode-note').hidden = googleCal.configured;
   }
   function clearResults() {
-    results = []; batch = null; runError = ''; runInfo = false;
+    results = []; batch = null; runError = ''; runInfo = false; undoOpen = false;
     $('add-results').replaceChildren(); $('add-summary').textContent = ''; $('progress').textContent = '';
     $('retry-failed').hidden = true; $('open-calendar').hidden = true; $('preview-list').hidden = false;
   }
@@ -159,12 +166,15 @@
     $('preview-list').replaceChildren(...events.map(evt => {
       const li = node('li', `${evt.label} · `); li.append(node('span', evt.summary || '(이름을 넣으세요)', evt.summary ? '' : 'muted'), node('span', ` · ${E.COLORS[evt.color].label}`)); return li;
     }));
-    $('add-button').textContent = `${state.year}년 ${state.month}월 일정 ${events.length}개${testMode() ? ' 넣기 (시험)' : `를 ${targetText(chosen)}에 넣기`}`;
+    // after a run the same button checks again and skips what is in, so it says so (SOP-014 C round 2)
+    const again = !testMode() && results.some(r => r.status !== 'pending');
+    $('add-button').textContent = `${state.year}년 ${state.month}월 일정 ${events.length}개${testMode() ? ' 넣기 (시험)' : `를 ${targetText(chosen)}에 ${again ? '다시 넣기 (이미 들어간 것은 건너뜀)' : '넣기'}`}`;
     $('add-button').disabled = busy || reading || events.length === 0; $('empty-note').hidden = events.length !== 0;
     $('test-add-note').hidden = !testMode() || events.length === 0;
     $('test-add-note').textContent = state.sample ? '예시라 눌러도 실제 달력에는 넣지 않고 넣을 목록만 보여 줍니다.' : '시험 모드라 눌러도 실제 달력에는 넣지 않고 넣을 목록만 보여 줍니다.';
-    for (const id of ['pick-photo', 'try-sample', 'file-input', 'year-select', 'month-select', 'week-start-select', 'name-yellow', 'name-blue', 'restore-detected', 'reset-button', 'login-button', 'logout-button', 'calendar-allow']) $(id).disabled = busy || reading;
-    renderCalendarField(); showValidation(false);
+    for (const id of ['pick-photo', 'try-sample', 'file-input', 'year-select', 'month-select', 'week-start-select', 'name-yellow', 'name-blue', 'restore-detected', 'reset-button', 'login-button', 'logout-button', 'calendar-allow', 'calendar-reload']) $(id).disabled = busy || reading;
+    $('target-change').hidden = testMode();
+    renderCalendarField(); renderView(); renderInvite(); renderUndo(); showValidation(false);
   }
   // ---- P-009: the calendar to add to ----
   function calendarName(id) { return id === 'primary' ? '내 기본 달력' : (calendars || []).find(c => c.id === id)?.name || '고른 달력'; }
@@ -172,7 +182,7 @@
   function renderCalendarField() {
     // the example and test mode never write, so there is nothing to choose
     const show = googleCal.configured && !state.sample;
-    $('calendar-field').hidden = !show;
+    $('calendar-pick').hidden = !show;  // its own section before step 2: chosen first, then added (SOP-014 C, D)
     if (!show) return;
     const signed = googleCal.isSignedIn(), options = [{ id: 'primary', name: '내 기본 달력' }, ...(calendars || [])];
     const select = $('calendar-select'), key = JSON.stringify(options);
@@ -187,6 +197,7 @@
     $('calendar-note').textContent = signed ? calendarNote + sharedHint
       : '로그인하면 넣을 달력을 고를 수 있고, 전에 고른 달력도 다시 나옵니다. 구글 권한 화면이 나오면 캘린더 일정을 보고 수정하는 항목은 꼭, 공유 달력에 넣으려면 캘린더 목록을 보는 항목도 체크해 주세요.';
     $('calendar-allow').hidden = !signed || !!calendars;
+    $('calendar-reload').hidden = !signed || !calendars;  // a calendar made in Google Calendar meanwhile (P-012)
   }
   function savedChoices() { const v = readStorage(CALENDAR_KEY); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }
   function rememberChoice(id) {
@@ -198,25 +209,233 @@
   // After every sign-in: the calendars this person can write to, their person key and their remembered choice.
   // Without the list (permission left unticked, or reading failed) only the primary calendar and the P-002 ids are used.
   async function loadCalendars() {
-    calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = '';
+    calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = ''; primaryId = ''; primaryColor = '';
     if (!listGranted) { calendarNote = '내 기본 달력에만 넣습니다. 공유 달력에 넣으려면 아래 단추를 눌러 캘린더 목록을 보는 항목도 허용해 주세요.'; return; }
     try {
       const items = await googleCal.listCalendars(), primary = items.find(c => c.primary);
       if (!primary || !primary.id) throw new Error('no primary calendar in the list');
       const writable = items.filter(c => !c.primary && c.id && ['writer', 'owner'].includes(c.accessRole));
       const list = [...writable.filter(c => !c.hidden), ...writable.filter(c => c.hidden)]
-        .map(c => ({ id: c.id, name: E.cleanName(c.summaryOverride || c.summary) || c.id, hidden: !!c.hidden }));
+        .map(c => ({ id: c.id, name: E.cleanName(c.summaryOverride || c.summary) || c.id, hidden: !!c.hidden, role: c.accessRole, color: c.backgroundColor || '' }));
       calendars = list; ownerKey = E.ownerKey(primary.id); accountLabel = primary.summaryOverride || primary.summary || primary.id;
+      primaryId = primary.id; primaryColor = primary.backgroundColor || '';
       const saved = savedChoices()[ownerKey];
       if (typeof saved === 'string' && saved !== 'primary') {
-        if (list.some(c => c.id === saved)) chosen = saved;
+        if (list.some(c => c.id === saved)) { chosen = saved; calendarNote = `전에 고른 ${targetText(saved)}을 다시 골라 두었습니다. `; }
         else { rememberChoice('primary'); calendarNote = '전에 고른 달력을 목록에서 찾지 못해 내 기본 달력으로 바꿨습니다. '; }
       }
       calendarNote += '공유받은 달력은 초대 메일에서 내 달력 목록에 추가해야 여기에 나옵니다.';
     } catch (_) {
-      calendars = null; ownerKey = ''; chosen = 'primary';
+      calendars = null; ownerKey = ''; chosen = 'primary'; primaryId = ''; primaryColor = '';
       calendarNote = '달력 목록을 읽지 못해 내 기본 달력에만 넣습니다. 아래 단추로 다시 읽을 수 있습니다.';
     }
+  }
+  // ---- P-011: my calendar, one month of the chosen calendar ----
+  const pad2 = n => String(n).padStart(2, '0');
+  const localDay = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  function shiftDay(iso, delta) {
+    const [y, m, d] = iso.split('-').map(Number), t = new Date(Date.UTC(y, m - 1, d + delta));
+    return `${t.getUTCFullYear()}-${pad2(t.getUTCMonth() + 1)}-${pad2(t.getUTCDate())}`;
+  }
+  // The days of year-month an event covers. All-day dates stay as they are (end date excluded); timed events use
+  // this device's time zone, and one ending at midnight does not reach the next day.
+  function coveredDays(ev, year, month) {
+    let from, to;
+    if (ev.start && ev.start.date) {
+      from = ev.start.date; to = shiftDay((ev.end && ev.end.date) || ev.start.date, -1);
+      if (to < from) to = from;
+    } else if (ev.start && ev.start.dateTime) {
+      const s = new Date(ev.start.dateTime), e = new Date((ev.end && ev.end.dateTime) || ev.start.dateTime);
+      from = localDay(s); to = localDay(new Date(Math.max(s.getTime(), e.getTime() - 1)));
+    } else return [];
+    const first = `${year}-${pad2(month)}-01`, last = `${year}-${pad2(month)}-${pad2(E.daysInMonth(year, month))}`;
+    const out = [];
+    for (let d = from > first ? from : first; d <= (to < last ? to : last); d = shiftDay(d, 1)) out.push(Number(d.slice(8)));
+    return out;
+  }
+  function viewShown() { return googleCal.configured && !state.sample; }
+  function setViewMonth(year, month) { view.year = year; view.month = month; view.picked = 0; }
+  // forget what is on screen at once (another calendar, account or the example): a late answer cannot come back
+  function dropView(stateName, note) { view.seq++; view.items = []; view.state = stateName; view.note = note || ''; view.picked = 0; }
+  function viewFailure(err) {
+    if (err.code === 'auth') return '로그인이 끝났습니다. 위의 구글 로그인을 다시 누르면 내 달력이 보입니다.';
+    if (['forbidden', 'calendar'].includes(err.code)) return '이 달력을 읽을 수 없습니다(권한이 없거나 목록에서 빠짐). 다른 달력을 고르거나 다시 읽기를 눌러 주세요.';
+    if (err.code === 'network') return '인터넷 연결을 확인한 뒤 다시 읽기를 눌러 주세요.';
+    return '구글 서버가 잠시 응답하지 않습니다. 잠시 뒤 다시 읽기를 눌러 주세요.';
+  }
+  async function loadView() {
+    if (!viewShown()) return;
+    if (!googleCal.isSignedIn()) { dropView('signed-out', '로그인하면 내 달력이 보입니다.'); renderView(); return; }
+    dropView('loading', `${targetText(chosen)}을 읽는 중…`);
+    const key = { seq: view.seq, gen: googleCal.generation(), calendarId: chosen, year: view.year, month: view.month };
+    renderView();
+    // two days either side, filtered by date below: an all-day event of a calendar in another time zone is not lost
+    const timeMin = new Date(key.year, key.month - 1, 1 - 2).toISOString(), timeMax = new Date(key.year, key.month, 1 + 2).toISOString();
+    let result, failure;
+    try { result = await googleCal.listEvents(key.calendarId, timeMin, timeMax); } catch (err) { failure = err; }
+    // an answer for an earlier read, sign-in, calendar or month is dropped (P-011 Codex review 1)
+    if (key.seq !== view.seq || key.gen !== googleCal.generation() || key.calendarId !== chosen || !viewShown()) return;
+    if (failure) {
+      view.state = failure.code === 'auth' ? 'signed-out' : 'error'; view.note = viewFailure(failure);
+      renderView(); connection(); return;
+    }
+    if (!result.complete) {  // never a part shown as the whole month
+      view.state = 'partial'; view.note = '일정이 많아 이 달을 다 읽지 못했습니다. 다시 읽기를 누르거나 구글 달력에서 보세요.';
+      renderView(); return;
+    }
+    const startOf = ev => (ev.start && ev.start.dateTime ? new Date(ev.start.dateTime).getTime() : 0);
+    view.items = result.items.map(ev => ({ ev, days: coveredDays(ev, key.year, key.month) })).filter(x => x.days.length)
+      .sort((a, b) => a.days[0] - b.days[0] || startOf(a.ev) - startOf(b.ev));
+    view.state = 'ready'; view.note = view.items.length ? '' : '이 달에는 일정이 없습니다.';
+    renderView();
+  }
+  function colorOf(ev) {
+    if (PALETTE[ev.colorId]) return PALETTE[ev.colorId];
+    const own = chosen === 'primary' ? primaryColor : ((calendars || []).find(c => c.id === chosen) || {}).color;
+    return own || 'var(--accent)';
+  }
+  function dayText(iso) {
+    const [y, m, d] = iso.split('-').map(Number);
+    return `${m}월 ${d}일 (${weekdays[new Date(Date.UTC(y, m - 1, d)).getUTCDay()]})`;
+  }
+  function eventText(ev) {
+    const isNew = justAdded.calendarId === chosen && justAdded.ids.has(ev.id);
+    let when;
+    if (ev.start && ev.start.date) {
+      const lastDay = shiftDay((ev.end && ev.end.date) || ev.start.date, -1);
+      when = lastDay > ev.start.date ? `${dayText(ev.start.date)} ~ ${dayText(lastDay)}` : `${dayText(ev.start.date)} 하루 종일`;
+    } else {
+      const s = new Date(ev.start.dateTime);
+      when = `${dayText(localDay(s))} ${s.toLocaleTimeString('ko-KR', { hour: 'numeric', minute: '2-digit' })}`;
+    }
+    return { isNew, text: `${when} · ${E.cleanName(ev.summary) || '(제목 없음)'}${isNew ? ' · 방금 넣음' : ''}` };
+  }
+  function renderView() {
+    const show = viewShown();
+    $('my-calendar').hidden = !show;
+    if (!show) return;
+    if (!view.year) setViewMonth(state.active && !state.sample ? state.year : new Date().getFullYear(), state.active && !state.sample ? state.month : new Date().getMonth() + 1);
+    $('my-calendar').dataset.state = view.state;
+    $('view-title').textContent = `${view.year}년 ${view.month}월 · ${calendarName(chosen)}`;
+    $('view-note').textContent = view.note; $('view-note').hidden = !view.note;
+    $('view-retry').hidden = !['error', 'partial'].includes(view.state);
+    $('view-open').href = E.monthUrl(view.year, view.month);
+    for (const id of ['view-prev', 'view-next', 'view-today']) $(id).disabled = view.state === 'signed-out';
+    // before signing in an empty month would read as 'no events': only the guidance shows
+    $('view-grid').hidden = $('view-list').hidden = $('view-legend').hidden = view.state === 'signed-out';
+    const counts = {}, byDay = {};
+    for (const it of view.items) for (const d of it.days) { counts[d] = (counts[d] || 0) + 1; (byDay[d] = byDay[d] || []).push(it); }
+    const weekStart = state.active && !state.sample ? state.weekStart : 0, cells = [];
+    for (let c = 0; c < 7; c++) cells.push(node('span', weekdays[(c + weekStart) % 7]));
+    for (let c = 0; c < R.firstColumn(view.year, view.month, weekStart); c++) { const blank = node('span'); blank.setAttribute('aria-hidden', 'true'); cells.push(blank); }
+    const today = localDay(new Date());
+    for (let d = 1; d <= R.daysInMonth(view.year, view.month); d++) {
+      const n = counts[d] || 0, b = node('button'); b.type = 'button'; b.dataset.day = d; b.dataset.count = n;
+      const weekday = weekdays[new Date(Date.UTC(view.year, view.month - 1, d)).getUTCDay()];
+      b.setAttribute('aria-label', `${d}, ${view.month}월 ${d}일 ${weekday}요일, 일정 ${n}개`);  // starts with the visible text (WCAG 2.5.3)
+      if (`${view.year}-${pad2(view.month)}-${pad2(d)}` === today) b.classList.add('today');
+      const marks = node('span', undefined, 'marks'); marks.setAttribute('aria-hidden', 'true');
+      for (const it of (byDay[d] || []).slice(0, 3)) { const dot = node('span', undefined, 'dot'); dot.style.background = colorOf(it.ev); marks.append(dot); }
+      if (n > 3) marks.append(node('span', `+${n - 3}`, 'more'));
+      b.append(node('span', d), marks);
+      b.setAttribute('aria-pressed', String(view.picked === d)); b.classList.toggle('picked', view.picked === d);
+      b.onclick = () => {  // a picked day shows its events only; pressing it again shows the whole month
+        view.picked = view.picked === d ? 0 : d; renderView();
+        const li = $('view-list').querySelector('li[data-id]');
+        if (view.picked && li) { li.focus(); li.scrollIntoView({ block: 'nearest' }); }
+        else $(view.picked ? 'view-day-title' : 'view-list').scrollIntoView({ block: 'nearest' });
+      };
+      cells.push(b);
+    }
+    $('view-grid').replaceChildren(...cells);
+    const shown = view.picked ? view.items.filter(it => it.days.includes(view.picked)) : view.items;
+    $('view-day-title').hidden = $('view-all').hidden = !view.picked;
+    if (view.picked) {
+      const iso = `${view.year}-${pad2(view.month)}-${pad2(view.picked)}`;
+      $('view-day-title').textContent = shown.length ? `${dayText(iso)} 일정 ${shown.length}개` : `${dayText(iso)}에는 일정이 없습니다.`;
+    }
+    $('view-list').replaceChildren(...shown.map(it => {
+      const { isNew, text } = eventText(it.ev), li = node('li');
+      li.dataset.id = it.ev.id; li.dataset.date = `${view.year}-${pad2(view.month)}-${pad2(it.days[0])}`; li.dataset.new = String(isNew); li.tabIndex = -1;
+      const swatch = node('span', undefined, 'swatch'); swatch.style.background = colorOf(it.ev); swatch.setAttribute('aria-hidden', 'true');
+      li.append(swatch, node('span', text));
+      if (/^https:\/\//.test(it.ev.htmlLink || '')) {  // details, editing and deleting stay in Google Calendar
+        const a = node('a', '열기', 'open'); a.href = it.ev.htmlLink; a.target = '_blank'; a.rel = 'noopener noreferrer';
+        a.setAttribute('aria-label', `${E.cleanName(it.ev.summary) || '(제목 없음)'} 구글 달력에서 열기 (새 창)`);
+        li.append(a);
+      }
+      return li;
+    }));
+  }
+  // ---- '방금 넣은 일정 지우기': only what this run added, after one confirmation (SOP-014 evaluators C, D) ----
+  function renderUndo() {
+    const added = results.filter(r => r.status === 'added' && r.id), can = !testMode() && !!batch && added.length > 0;
+    $('undo-run').hidden = !can || undoOpen || busy;  // not a grey button with no reason while adding (SOP-014 C round 2)
+    $('undo-run').textContent = `방금 넣은 ${added.length}개 지우기`;
+    $('undo-box').hidden = !can || !undoOpen;
+    if (can && undoOpen) $('undo-text').textContent = `방금 넣은 ${added.length}개를 ${batch.calendarName}에서 지웁니다. 전에 있던 일정은 그대로 둡니다.`;
+    for (const id of ['undo-run', 'undo-confirm', 'undo-cancel']) $(id).disabled = busy || reading;
+  }
+  // ---- P-012: share the app, invite people to the chosen calendar ----
+  const appUrl = () => location.origin + location.pathname;
+  const SETTINGS = 'https://calendar.google.com/calendar/r/settings';
+  function calendarSettingsUrl(id) {
+    const b64 = encodeURIComponent(btoa(unescape(encodeURIComponent(id))).replace(/=+$/, ''));
+    return `${SETTINGS}/calendar/${b64}${primaryId ? `?authuser=${encodeURIComponent(primaryId)}` : ''}`;
+  }
+  function renderInvite() {
+    const show = googleCal.configured && !state.sample;
+    $('invite').hidden = !show;
+    if (!show) return;
+    // whose sharing can this person change: the primary calendar and calendars they own; writers ask the owner
+    const entry = chosen === 'primary' ? (primaryId ? { id: primaryId, role: 'owner' } : null) : (calendars || []).find(c => c.id === chosen) || null;
+    const link = $('invite-settings'), name = targetText(chosen);
+    $('invite-owner-note').hidden = true; $('invite-settings-note').hidden = true; link.hidden = false;
+    if (entry && entry.role === 'owner') {
+      link.href = calendarSettingsUrl(entry.id); link.textContent = `${name} 공유 설정 열기 (새 창)`;
+    } else if (entry) {
+      link.hidden = true;
+      $('invite-owner-note').textContent = `${name}의 공유는 그 달력의 주인만 바꿀 수 있습니다. 같이 쓸 사람을 넣어 달라고 달력 주인에게 부탁하세요. 초대 메시지는 아래 단추로 보낼 수 있습니다.`;
+      $('invite-owner-note').hidden = false;
+    } else {
+      link.href = SETTINGS; link.textContent = '구글 캘린더 설정 열기 (새 창)';
+      $('invite-settings-note').textContent = "구글 캘린더 설정 화면 왼쪽 '내 캘린더의 설정'에서 같이 쓸 달력을 고르고, '공유 대상'(특정 사용자와 공유)에 사람을 추가하세요. 내가 주인이 아닌 달력은 주인에게 부탁하세요.";
+      $('invite-settings-note').hidden = false;
+    }
+  }
+  function inviteMessage() {
+    const name = chosen === 'primary' ? `${accountLabel || '내'} 기본 달력` : calendarName(chosen);
+    return `동그라미 일정으로 '${name}' 달력에 같이 일정을 넣어요.\n1. 받은 초대 메일에서 '${name}' 달력을 내 캘린더 목록에 추가하세요.\n`
+      // the person invited asks whoever sent this, not an 'operator' they do not know (SOP-014 C round 2)
+      + "2. 아래 웹을 열고 구글 로그인을 누르세요. 이 웹은 시험 운영 중이라 쓸 사람을 테스트 사용자로 미리 넣어야 합니다. 구글이 '액세스 차단'이라고 하면 이 메시지를 보낸 나에게 알려 주세요.\n"
+      + `3. 로그인할 때 권한 화면에서 캘린더 목록 보기 항목도 허용하고, '내 달력'에서 '${name}'을 고르세요.`;
+  }
+  // the phone's share sheet, else the clipboard, else the text to copy by hand; closing the sheet is not an error
+  async function shareOrCopy(data, copyText, noteId, copiedText) {
+    const box = $(noteId);
+    // right under the button: what happened, the text in a box when it could not be copied, mail and SMS links
+    const show = (message, withText) => {
+      const parts = [node('p', message)];
+      if (withText) {
+        const area = node('textarea'); area.readOnly = true; area.rows = 4; area.textContent = copyText; area.setAttribute('aria-label', '보낼 글');
+        parts.push(area);
+      }
+      const mail = node('a', '메일로 보내기'); mail.href = `mailto:?subject=${encodeURIComponent(data.title)}&body=${encodeURIComponent(copyText)}`;
+      const sms = node('a', '문자로 보내기'); sms.href = `sms:?&body=${encodeURIComponent(copyText)}`;
+      const links = node('p', undefined, 'send-links'); links.append(mail, sms); parts.push(links);
+      box.replaceChildren(...parts); box.hidden = false;
+      // as tall as its text, so the whole message is read before sending (SOP-014 C, D round 2)
+      const area = box.querySelector('textarea');
+      if (area) { area.style.height = 'auto'; area.style.height = `${area.scrollHeight + 2}px`; }
+      box.scrollIntoView({ block: 'nearest' });
+      if (area) area.select();
+    };
+    box.replaceChildren(); box.hidden = true;
+    if (typeof navigator.share === 'function') {
+      try { await navigator.share(data); return; } catch (err) { if (err && err.name === 'AbortError') return; }
+    }
+    try { await navigator.clipboard.writeText(copyText); show(copiedText, false); }
+    catch (_) { show('이 기기에서는 바로 보내거나 복사할 수 없습니다. 아래 글을 골라 복사해 카카오톡 같은 메신저에 붙여 넣거나, 메일·문자로 보내세요.', true); }
   }
   // the target moved away from the one a run (or a press) was made for: another calendar or another account
   function movedFrom(target) { return target.calendarId !== chosen || (!!target.ownerKey && target.ownerKey !== ownerKey); }
@@ -246,6 +465,8 @@
       if (sample) { next.year = 2027; next.month = 1; }
       next.detected = { cells: copyCells(next.cells), weekStart: next.weekStart };
       state = next; validationShown = false; $('restore-note').hidden = true; clearResults(); save();
+      // my calendar follows the photo's month; the example steps it aside and drops any read in flight (P-011)
+      if (sample) dropView(googleCal.isSignedIn() ? 'loading' : 'signed-out'); else { setViewMonth(state.year, state.month); viewDue = true; }
       $('status').textContent = !analysis.ok ? "달력 칸을 찾지 못했습니다. 달력 앱의 '월' 화면 전체를 캡처한 사진인지 확인해 주세요. 아래 2단계 달력에서 날짜를 직접 골라도 됩니다." :
         !colors.some(c => state.cells[c].size) ? '동그라미를 찾지 못했습니다. 노랑·파랑 펜으로 그렸는지 확인하거나, 아래 2단계 달력에서 날짜를 직접 고르세요.'
           : sample ? '예시 사진을 읽었습니다. 아래 2단계에서 확인해 보세요.' : '사진을 읽었습니다. 아래 2단계에서 달과 날짜를 확인해 주세요.';
@@ -253,6 +474,7 @@
     } catch (_) { $('status').textContent = '사진을 열지 못했습니다. JPG나 PNG 사진을 골라 주세요.'; }
     finally {
       clearInterval(timer); if (objectURL) URL.revokeObjectURL(src); reading = false; render();
+      if (viewDue) { viewDue = false; loadView(); }
       // on a phone step 2 starts below the fold: bring it into view so the result is seen
       // instant (not smooth) so it also happens in a background or hidden tab
       if (showCheck) { $('step-check').scrollIntoView({ block: 'start' }); $('check-title').focus({ preventScroll: true }); }
@@ -264,14 +486,16 @@
   }
   function updateResult(result) {
     result.li.dataset.status = result.status;
-    const label = { test: '시험', added: '넣음', exists: '이미 있어 건너뜀', failed: `실패: ${result.message || ''}`, pending: '대기' }[result.status];
+    const label = { test: '시험', added: '넣음', exists: '이미 있어 건너뜀', failed: `실패: ${result.message || ''}`, pending: '대기', deleted: '지움' }[result.status];
     result.li.textContent = `${result.evt.label} · ${result.evt.summary} · ${E.COLORS[result.evt.color].label} — ${label}`;
   }
   async function signIn(consent = false, hint = '') {
     const response = await googleCal.signIn({ consent, hint });
     accountLabel = response.label; listGranted = response.listGranted; $('login-error').hidden = true;
     connection();  // signed in: show it now, the calendar list may take a moment
+    dropView('loading', '내 달력을 읽는 중…'); renderView();  // nothing of an earlier account stays on screen
     await loadCalendars(); connection();
+    loadView();  // not awaited: adding does not wait for the view
   }
   function summarize(authStopped, where, signInFailed) {
     const count = status => results.filter(r => r.status === status).length;
@@ -323,7 +547,7 @@
         if (!batch) batch = { calendarId: chosen, calendarName: targetText(chosen), ownerKey };
         for (let i = 0; i < queue.length; i++) {
           const r = queue[i]; $('progress').textContent = `넣는 중 ${i + 1}/${queue.length}`;
-          try { const result = await googleCal.insertIfMissing(r.evt, batch); r.status = result.status; r.message = ''; updateResult(r); }
+          try { const result = await googleCal.insertIfMissing(r.evt, batch); r.status = result.status; r.id = result.id; r.message = ''; updateResult(r); }
           catch (err) {
             r.status = 'failed'; r.message = err.message; updateResult(r);
             if (err.code === 'auth') {
@@ -350,8 +574,13 @@
         render();
       } else {
         render(); summarize(authStopped, batch ? batch.calendarName : targetText(pressed.calendarId), signInFailed); $('progress').textContent = '';
+        // my calendar shows the month just added, the added and already-there events marked (P-011)
+        if (batch) {
+          justAdded = { calendarId: batch.calendarId, ids: new Set(results.filter(r => ['added', 'exists'].includes(r.status) && r.id).map(r => r.id)) };
+          setViewMonth(state.year, state.month); loadView();
+        }
       }
-      $('add-summary').scrollIntoView({ block: 'nearest' });
+      $('add-summary').scrollIntoView({ block: 'center' });  // the result is seen without scrolling (SOP-014 D)
     }
   }
   $('pick-photo').onclick = () => $('file-input').click();
@@ -381,6 +610,8 @@
     try { await googleCal.signOut(); accountLabel = ''; }
     finally {
       listGranted = false; calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = ''; clearResults(); $('login-error').hidden = true;
+      primaryId = ''; primaryColor = ''; justAdded = { calendarId: '', ids: new Set() };
+      dropView('signed-out', '로그인하면 내 달력이 보입니다.');
       $('status').textContent = '로그아웃했습니다.';
       busy = false; render();
     }
@@ -389,13 +620,56 @@
     if (busy || reading) { render(); return; }
     chosen = $('calendar-select').value; rememberChoice(chosen);
     clearResults(); render();  // a run's results and its retry belong to the calendar it was made for
+    loadView();  // my calendar follows the choice; the previous calendar's answer is dropped
+  };
+  $('calendar-reload').onclick = async () => {
+    if (busy || reading) return;
+    busy = true; render();
+    try { await loadCalendars(); if (batch && movedFrom(batch)) clearResults(); }
+    finally { busy = false; render(); loadView(); }
+  };
+  $('view-prev').onclick = () => { setViewMonth(view.month === 1 ? view.year - 1 : view.year, view.month === 1 ? 12 : view.month - 1); loadView(); };
+  $('view-next').onclick = () => { setViewMonth(view.month === 12 ? view.year + 1 : view.year, view.month === 12 ? 1 : view.month + 1); loadView(); };
+  $('view-retry').onclick = () => loadView();
+  $('view-today').onclick = () => { const t = new Date(); setViewMonth(t.getFullYear(), t.getMonth() + 1); loadView(); };
+  $('view-all').onclick = () => { view.picked = 0; renderView(); $('view-list').scrollIntoView({ block: 'nearest' }); };
+  $('undo-run').onclick = () => { undoOpen = true; renderUndo(); $('undo-confirm').focus(); };
+  $('undo-cancel').onclick = () => { undoOpen = false; renderUndo(); $('undo-run').focus(); };
+  $('undo-confirm').onclick = async () => {
+    if (busy || reading || !batch) return;
+    const targets = results.filter(r => r.status === 'added' && r.id), where = batch.calendarName;
+    let removed = 0, failed = 0;
+    undoOpen = false; busy = true; runError = ''; render();
+    try {
+      if (!googleCal.isSignedIn()) {  // signed in again from this click; another account or calendar is not touched
+        await signIn();
+        if (movedFrom(batch)) { runError = '로그인한 계정이나 달력이 바뀌어 지우지 않았습니다. 확인한 뒤 다시 눌러 주세요.'; failed = targets.length; return; }
+      }
+      for (const r of targets) {
+        try { await googleCal.deleteEvent(batch.calendarId, r.id); r.status = 'deleted'; r.message = ''; removed++; justAdded.ids.delete(r.id); }
+        catch (err) { failed++; runError = err.message; if (err.code === 'auth') break; }
+        updateResult(r);
+      }
+    } catch (err) { runError = explain(err, 'add'); failed = targets.length - removed; }
+    finally {
+      busy = false; render();
+      $('add-summary').textContent = `${where}: 방금 넣은 ${removed}개를 지웠습니다.`
+        + (failed ? ` ${failed}개는 지우지 못했습니다. 다시 눌러 주세요.` : " 다시 넣으려면 위 '다시 넣기' 단추를 누르세요.");  // SOP-014 C round 2
+      renderUndo(); loadView();
+    }
+  };
+  $('share-app').onclick = () => shareOrCopy({ title: '동그라미 일정', text: '달력 사진의 동그라미 날짜를 구글 달력에 넣는 웹입니다.', url: appUrl() },
+    appUrl(), 'share-note', '주소를 복사했습니다. 메신저나 문자에 붙여 넣어 보내세요.');
+  $('invite-message').onclick = () => {
+    const text = inviteMessage();
+    shareOrCopy({ title: '동그라미 일정 초대', text, url: appUrl() }, `${text}\n${appUrl()}`, 'invite-note', '초대 메시지를 복사했습니다. 메신저나 문자에 붙여 넣어 보내세요.');
   };
   $('calendar-allow').onclick = async () => {
     if (busy || reading) return;
     busy = true; render();
     try {
       // the list permission was left unticked: ask again from this click; it was given but reading failed: read again
-      if (listGranted && googleCal.isSignedIn()) await loadCalendars();
+      if (listGranted && googleCal.isSignedIn()) { await loadCalendars(); loadView(); }
       else await signIn(true, /^[^@\s]+@[^@\s]+$/.test(accountLabel) ? accountLabel : '');  // offer the same account
       if (batch && movedFrom(batch)) clearResults();
     } catch (err) { calendarNote = `${err.message} 지금은 내 기본 달력에만 넣습니다.`; }
