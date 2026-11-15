@@ -1,5 +1,5 @@
 /*
- * Circled dates -> Google Calendar all-day event requests.
+ * Selected dates -> Google Calendar all-day event requests.
  * Pure functions: no network, no DOM. Used by app.js and by the tests.
  */
 (function (root, factory) {
@@ -25,6 +25,11 @@
     return isoDate(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
   }
   function daysInMonth(year, month) { return new Date(Date.UTC(year, month, 0)).getUTCDate(); }
+  function firstColumn(year, month, weekStart) { return (new Date(Date.UTC(year, month - 1, 1)).getUTCDay() - weekStart + 7) % 7; }
+  function cellDate(r, c, year, month, weekStart) {
+    const d = 7 * r + c - firstColumn(year, month, weekStart) + 1;
+    return d >= 1 && d <= daysInMonth(year, month) ? d : null;
+  }
   function weekdayName(year, month, day) { return WEEKDAYS[new Date(Date.UTC(year, month - 1, day)).getUTCDay()]; }
 
   // FNV-1a 32-bit as 8 hex digits: short, stable key part for the event name.
@@ -99,5 +104,5 @@
 
   function monthUrl(year, month) { return `https://calendar.google.com/calendar/r/month/${year}/${month}/1`; }
 
-  return { COLORS, COLOR_ORDER, KEY_PROP, buildEvents, validate, eventId, ownerKey, monthUrl, eventKey, isoDate, daysInMonth, cleanName };
+  return { COLORS, COLOR_ORDER, KEY_PROP, buildEvents, validate, eventId, ownerKey, monthUrl, eventKey, isoDate, daysInMonth, firstColumn, cellDate, cleanName };
 });
