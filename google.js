@@ -3,7 +3,8 @@
   const SCOPE = 'https://www.googleapis.com/auth/calendar.events';
   const messages = {
     auth: '로그인이 끝나 멈춤',
-    popup_closed: '구글 로그인 창이 닫혔습니다. 다시 눌러 주세요.',
+    popup_closed: "구글 로그인 창이 닫혔습니다. 다시 눌러 주세요. 구글이 '액세스 차단'이라고 했다면 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.",
+    denied: '구글 로그인이 허락되지 않았습니다. 권한 화면에서 허용하지 않았거나, 이 웹을 쓸 수 있는 사람(테스트 사용자)으로 아직 넣지 않은 계정입니다. 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.',
     popup_failed: '팝업이 막혔습니다. 이 사이트의 팝업을 허용한 뒤 다시 눌러 주세요.',
     scope: '달력 권한을 허용해야 넣을 수 있습니다. 다시 눌러 권한 화면에서 달력 항목을 허용해 주세요.',
     forbidden: '구글이 거절했습니다(권한 없음). 로그아웃한 뒤 다시 로그인해 주세요.',
@@ -24,7 +25,9 @@
         callback(resp) {
           if (!pending) return;
           const p = pending; pending = null;
-          if (resp.error || !window.google.accounts.oauth2.hasGrantedAllScopes(resp, SCOPE)) { clear(); p.reject(error('scope')); return; }
+          // access_denied: the user refused, or (Testing status) the account is not a test user (D-012)
+          if (resp.error) { clear(); p.reject(error(resp.error === 'access_denied' ? 'denied' : 'scope')); return; }
+          if (!window.google.accounts.oauth2.hasGrantedAllScopes(resp, SCOPE)) { clear(); p.reject(error('scope')); return; }
           token = resp.access_token; expires = Date.now() + Math.max(0, Number(resp.expires_in) - 60) * 1000;
           p.resolve();
         },
