@@ -1,34 +1,42 @@
 (function () {
   'use strict';
-  const SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+  const SCOPE_EVENTS = 'https://www.googleapis.com/auth/calendar.events';
+  // P-009: the list of calendars this person can use. Optional: without it only the primary calendar is used.
+  const SCOPE_LIST = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
+  const API = 'https://www.googleapis.com/calendar/v3';
   const messages = {
     auth: '로그인이 끝나 멈춤',
     popup_closed: "구글 로그인 창이 닫혔습니다. 다시 눌러 주세요. 구글이 '액세스 차단'이라고 했다면 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.",
     denied: '구글 로그인이 허락되지 않았습니다. 권한 화면에서 허용하지 않았거나, 이 웹을 쓸 수 있는 사람(테스트 사용자)으로 아직 넣지 않은 계정입니다. 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.',
     popup_failed: '팝업이 막혔습니다. 이 사이트의 팝업을 허용한 뒤 다시 눌러 주세요.',
     scope: '달력 권한을 허용해야 넣을 수 있습니다. 다시 눌러 권한 화면에서 달력 항목을 허용해 주세요.',
-    forbidden: '구글이 거절했습니다(권한 없음). 로그아웃한 뒤 다시 로그인해 주세요.',
+    forbidden: '구글이 거절했습니다(권한 없음). 이 달력에 일정을 넣을 수 있는 권한인지 확인하고, 로그아웃한 뒤 다시 로그인해 주세요.',
+    calendar: '이 달력을 찾지 못했거나 넣을 권한이 없습니다. 넣을 달력을 다시 고른 뒤 눌러 주세요.',
+    target: '넣을 달력을 확인하지 못했습니다. 넣을 달력을 다시 고른 뒤 눌러 주세요.',
     network: "인터넷 연결을 확인한 뒤 '실패한 것만 다시'를 눌러 주세요.",
     server: "구글 서버가 잠시 응답하지 않습니다. 잠시 뒤 '실패한 것만 다시'를 눌러 주세요.",
     conflict: '지워진 일정의 새 자리를 만들지 못했습니다. 구글 달력을 확인한 뒤 다시 눌러 주세요.',
   };
   const error = (code, message) => Object.assign(new Error(message || messages[code]), { code });
-  window.GoogleCalendar = { create({ clientId, calendarId = 'primary', fetchImpl = window.fetch.bind(window) }) {
+  window.GoogleCalendar = { create({ clientId, fetchImpl = window.fetch.bind(window) }) {
     const configured = !!clientId;
-    const base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
-    let token = '', expires = 0, loading, client, pending;
-    function clear() { token = ''; expires = 0; }
+    let token = '', expires = 0, listGranted = false, loading, client, pending;
+    function clear() { token = ''; expires = 0; listGranted = false; }
     function isSignedIn() { if (Date.now() >= expires) clear(); return !!token; }
     function init() {
       client = window.google.accounts.oauth2.initTokenClient({
-        client_id: clientId, scope: SCOPE,
+        client_id: clientId, scope: `${SCOPE_EVENTS} ${SCOPE_LIST}`,
         callback(resp) {
           if (!pending) return;
           const p = pending; pending = null;
-          // access_denied: the user refused, or (Testing status) the account is not a test user (D-012)
-          if (resp.error) { clear(); p.reject(error(resp.error === 'access_denied' ? 'denied' : 'scope')); return; }
-          if (!window.google.accounts.oauth2.hasGrantedAllScopes(resp, SCOPE)) { clear(); p.reject(error('scope')); return; }
+          const oauth = window.google.accounts.oauth2;
+          // access_denied: the user refused, or (Testing status) the account is not a test user (D-012).
+          // A second ask for the list permission (p.keep) leaves the token already held when it fails.
+          if (resp.error) { if (!p.keep) clear(); p.reject(error(resp.error === 'access_denied' ? 'denied' : 'scope')); return; }
+          // the events permission is required; the list permission may be left unticked (checked one by one)
+          if (!oauth.hasGrantedAllScopes(resp, SCOPE_EVENTS)) { if (!p.keep) clear(); p.reject(error('scope')); return; }
           token = resp.access_token; expires = Date.now() + Math.max(0, Number(resp.expires_in) - 60) * 1000;
+          listGranted = oauth.hasGrantedAllScopes(resp, SCOPE_LIST);
           p.resolve();
         },
         error_callback(resp) {
@@ -68,29 +76,53 @@
       if (res.status === 429 || res.status >= 500) throw error('server');
       return { status: res.status, body };
     }
-    function signIn() {
+    // consent: show the permission screen again, to get the list permission the person left unticked (P-009)
+    function signIn({ consent = false } = {}) {
       if (!configured) return Promise.reject(error('scope'));
+      const keep = consent && isSignedIn();
       const start = () => new Promise((resolve, reject) => {
         if (pending) { reject(error('popup_failed')); return; }
-        pending = { resolve, reject };
-        try { client.requestAccessToken({ prompt: '' }); } catch (_) { pending = null; reject(error('popup_failed')); }
+        pending = { resolve, reject, keep };
+        try { client.requestAccessToken({ prompt: consent ? 'consent' : '' }); } catch (_) { pending = null; reject(error('popup_failed')); }
       });
       // With preloading finished, requestAccessToken runs synchronously in the click.
       const access = client ? start() : preload().then(start);
       return access.then(async () => {
-        const r = await request(`${base}?maxResults=1`);
+        if (listGranted) return { listGranted: true, label: '' };  // the account name comes with the calendar list
+        const r = await request(`${API}/calendars/primary/events?maxResults=1`);
         if (r.status !== 200) throw error('server');
-        return { label: r.body.summary || '구글 달력' };
+        return { listGranted: false, label: r.body.summary || '구글 달력' };
       });
     }
-    async function insertIfMissing(evt) {
+    // calendarList.list: calendars this person can add events to (writer or owner), hidden ones included, every page
+    async function listCalendars() {
+      if (!listGranted) throw error('scope');
+      const items = [];
+      let pageToken = '';
+      for (let page = 0; page < 20; page++) {
+        const query = new URLSearchParams({ minAccessRole: 'writer', showHidden: 'true', maxResults: '250' });
+        if (pageToken) query.set('pageToken', pageToken);
+        const r = await request(`${API}/users/me/calendarList?${query}`);
+        if (r.status !== 200) throw error('server');
+        if (Array.isArray(r.body.items)) items.push(...r.body.items);
+        pageToken = r.body.nextPageToken || '';
+        if (!pageToken) return items;
+      }
+      throw error('server');  // more pages than any real list: show none rather than part of it
+    }
+    // target: { calendarId, ownerKey }, fixed for the whole run. The primary calendar keeps the P-002 ids (D-007).
+    async function insertIfMissing(evt, target = {}) {
+      const calendarId = target.calendarId || 'primary', owner = calendarId === 'primary' ? '' : target.ownerKey;
+      if (calendarId !== 'primary' && !owner) throw error('target');
+      const base = `${API}/calendars/${encodeURIComponent(calendarId)}/events`;
       for (let attempt = 0; attempt <= 3; attempt++) {
-        const id = window.CalendarEvents.eventId(evt, attempt), url = `${base}/${id}`;
+        const id = window.CalendarEvents.eventId(evt, attempt, owner), url = `${base}/${id}`;
         let r = await request(url);
         if (r.status === 200) { if (r.body.status !== 'cancelled') return { status: 'exists', id }; continue; }
         if (![404, 410].includes(r.status)) throw error('server');
         r = await request(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({}, evt.body, { id })) });
         if ([200, 201].includes(r.status)) return { status: 'added', id, htmlLink: r.body.htmlLink };
+        if (r.status === 404) throw error('calendar');
         if (r.status === 409) {
           r = await request(url);
           if (r.status === 200 && r.body.status !== 'cancelled') return { status: 'exists', id };
@@ -108,6 +140,6 @@
         catch (_) { clear(); resolve(); }
       });
     }
-    return { configured, preload, signIn, isSignedIn, signOut, insertIfMissing };
+    return { configured, preload, signIn, isSignedIn, signOut, listCalendars, insertIfMissing };
   } };
 })();

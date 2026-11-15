@@ -17,6 +17,7 @@ label { display:block; font-weight:650; margin:14px 0 6px; } input,select { widt
 #mode-badge { font-weight:650; } .notice { background:var(--notice); border-radius:12px; padding:16px; } .notice button { display:block; margin-top:10px; }
 .muted { color:var(--muted); } .error { color:var(--error); font-weight:600; } [aria-invalid="true"] { border:2px solid var(--error); }
 .month-fields { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+#calendar-field { padding-bottom:6px; border-bottom:1px solid var(--line); } #calendar-field label { margin-top:0; } #calendar-field button { display:block; width:100%; margin:10px 0; }
 #month-candidates button { margin:4px; } #month-candidates button[aria-pressed="true"] { background:var(--accent); color:var(--on-accent); border-color:var(--accent); font-weight:700; }
 #add-summary:not(:empty) { font-weight:700; } #photo-preview { width:100%; height:auto; margin-top:16px; border-radius:10px; }
 #mini-calendar { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; }

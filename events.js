@@ -84,12 +84,20 @@
   // Client-chosen event id (base32hex: 0-9 and a-v, 5-1024 chars). The same date, colour and name always give the
   // same id, so a second insert (retry after a lost response, a second tab) gets 409 instead of a duplicate.
   // attempt > 0 gives a new id for the case where the old id belongs to an event the user deleted.
-  function eventId(evt, attempt) {
-    const base = `cc1${evt.date.replace(/-/g, '')}${COLOR_ORDER.indexOf(evt.color)}${hash(evt.summary)}`;
+  // owner (P-009): the person key, only for calendars other than the primary one. Without it the id is the P-002 id,
+  // so events already in a primary calendar are still found; with it two people adding the same name on the same
+  // date to one shared calendar each get their own event.
+  function eventId(evt, attempt, owner) {
+    if (owner && !/^[0-9a-f]{8}$/.test(owner)) throw new Error('owner key must be 8 hex digits');
+    const base = `cc1${evt.date.replace(/-/g, '')}${COLOR_ORDER.indexOf(evt.color)}${hash(evt.summary)}${owner ? 'o' + owner : ''}`;
     return attempt ? `${base}r${attempt}` : base;
   }
 
+  // Person key: 8 hex digits from the account's primary calendar id (its e-mail address). Only the key goes into
+  // event ids and this device's storage, never the address itself.
+  function ownerKey(primaryId) { return hash(String(primaryId == null ? '' : primaryId).trim().toLowerCase()); }
+
   function monthUrl(year, month) { return `https://calendar.google.com/calendar/r/month/${year}/${month}/1`; }
 
-  return { COLORS, COLOR_ORDER, KEY_PROP, buildEvents, validate, eventId, monthUrl, eventKey, isoDate, daysInMonth, cleanName };
+  return { COLORS, COLOR_ORDER, KEY_PROP, buildEvents, validate, eventId, ownerKey, monthUrl, eventKey, isoDate, daysInMonth, cleanName };
 });

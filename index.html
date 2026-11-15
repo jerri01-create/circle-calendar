@@ -54,6 +54,12 @@
   </section>
   <section id="step-add" hidden>
     <h2>4. 구글 달력에 넣기</h2>
+    <div id="calendar-field" hidden>
+      <label for="calendar-select">넣을 달력</label>
+      <select id="calendar-select" aria-describedby="calendar-note"></select>
+      <p id="calendar-note" class="muted" aria-live="polite"></p>
+      <button id="calendar-allow" type="button" hidden>다른 달력도 고르기</button>
+    </div>
     <ul id="preview-list"></ul><ul id="add-results"></ul><p id="add-error" class="error" role="alert" hidden></p>
     <button class="primary" id="add-button" type="button"></button><p id="test-add-note" class="muted" hidden></p><p id="empty-note" hidden>넣을 날짜가 없습니다. 위 달력에서 날짜를 골라 주세요.</p>
     <p id="progress" role="status" aria-live="polite"></p><p id="add-summary" role="status"></p>
