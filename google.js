@@ -9,7 +9,7 @@
     popup_closed: "구글 로그인 창이 닫혔습니다. 다시 눌러 주세요. 구글이 '액세스 차단'이라고 했다면 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.",
     denied: '구글 로그인이 허락되지 않았습니다. 권한 화면에서 허용하지 않았거나, 이 웹을 쓸 수 있는 사람(테스트 사용자)으로 아직 넣지 않은 계정입니다. 운영자에게 내 구글 이메일을 테스트 사용자로 넣어 달라고 하세요.',
     popup_failed: '팝업이 막혔습니다. 이 사이트의 팝업을 허용한 뒤 다시 눌러 주세요.',
-    scope: '달력 권한을 허용해야 넣을 수 있습니다. 다시 눌러 권한 화면에서 달력 항목을 허용해 주세요.',
+    scope: '구글 권한 화면에서 캘린더 일정을 보고 수정하는 항목을 허용하지 않아 넣을 수 없습니다.',
     forbidden: '구글이 거절했습니다(권한 없음). 이 달력에 일정을 넣을 수 있는 권한인지 확인하고, 로그아웃한 뒤 다시 로그인해 주세요.',
     calendar: '이 달력을 찾지 못했거나 넣을 권한이 없습니다. 넣을 달력을 다시 고른 뒤 눌러 주세요.',
     target: '넣을 달력을 확인하지 못했습니다. 넣을 달력을 다시 고른 뒤 눌러 주세요.',
@@ -76,14 +76,16 @@
       if (res.status === 429 || res.status >= 500) throw error('server');
       return { status: res.status, body };
     }
-    // consent: show the permission screen again, to get the list permission the person left unticked (P-009)
-    function signIn({ consent = false } = {}) {
+    // consent: show the permission screen again, to get the list permission the person left unticked (P-009);
+    // hint: the signed-in account's address, so Google offers that account rather than another one on the device
+    function signIn({ consent = false, hint = '' } = {}) {
       if (!configured) return Promise.reject(error('scope'));
       const keep = consent && isSignedIn();
       const start = () => new Promise((resolve, reject) => {
         if (pending) { reject(error('popup_failed')); return; }
         pending = { resolve, reject, keep };
-        try { client.requestAccessToken({ prompt: consent ? 'consent' : '' }); } catch (_) { pending = null; reject(error('popup_failed')); }
+        try { client.requestAccessToken(Object.assign({ prompt: consent ? 'consent' : '' }, hint ? { login_hint: hint } : {})); }
+        catch (_) { pending = null; reject(error('popup_failed')); }
       });
       // With preloading finished, requestAccessToken runs synchronously in the click.
       const access = client ? start() : preload().then(start);

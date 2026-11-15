@@ -14,7 +14,11 @@
   let state = fresh(), results = [], busy = false, reading = false, accountLabel = '', validationShown = false, photoSequence = 0;
   // P-009 calendar choice: calendars = writable calendars from the list (null = not read), ownerKey = person key
   // ('' = account unknown), batch = the target fixed when a run starts, runError = the reason shown by the button
-  let calendars = null, ownerKey = '', chosen = 'primary', calendarNote = '', listGranted = false, batch = null, runError = '', shownOptions = '';
+  let calendars = null, ownerKey = '', chosen = 'primary', calendarNote = '', listGranted = false, batch = null, runError = '', runInfo = false, shownOptions = '';
+  // the permission message says which button brings the permission screen back, by the button that was pressed
+  const AGAIN = { add: ' 넣기 단추를 다시 누르면 권한 화면이 다시 나오니, 그 항목에 체크해 주세요.',
+    login: ' 구글 로그인을 다시 누르면 권한 화면이 다시 나오니, 그 항목에 체크해 주세요.' };
+  const explain = (err, where) => err.message + (err.code === 'scope' ? AGAIN[where] : '');
   function readStorage(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (_) { return null; } }
   function writeStorage(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) { /* Storage is optional. */ } }
   function node(tag, text, className) {
@@ -40,14 +44,14 @@
     $('test-mode-note').hidden = googleCal.configured;
   }
   function clearResults() {
-    results = []; batch = null; runError = '';
+    results = []; batch = null; runError = ''; runInfo = false;
     $('add-results').replaceChildren(); $('add-summary').textContent = ''; $('progress').textContent = '';
     $('retry-failed').hidden = true; $('open-calendar').hidden = true; $('preview-list').hidden = false;
   }
   function showValidation(focus) {
     for (const c of colors) { $('error-' + c).hidden = true; $('name-' + c).removeAttribute('aria-invalid'); }
     // the reason a run stopped stays next to the button until the results are cleared
-    $('add-error').textContent = runError; $('add-error').hidden = !runError;
+    $('add-error').textContent = runError; $('add-error').hidden = !runError; $('add-error').classList.toggle('info', runInfo);
     const problems = E.validate(inputData());
     if (!validationShown) return problems;
     for (const p of problems) {
@@ -178,7 +182,10 @@
     }
     select.value = chosen;
     select.disabled = busy || reading || !signed || !calendars;
-    $('calendar-note').textContent = signed ? calendarNote : '로그인하면 넣을 달력을 고를 수 있습니다.';
+    // each person's events go in separately (D-013): say so, so two same-looking events are not taken for a mistake
+    const sharedHint = chosen === 'primary' ? '' : ' 공유 달력에는 넣은 사람마다 따로 들어갑니다. 누구 일정인지 보이게 이름에 사람을 넣어 주세요(예: 엄마 근무).';
+    $('calendar-note').textContent = signed ? calendarNote + sharedHint
+      : '로그인하면 넣을 달력을 고를 수 있고, 전에 고른 달력도 다시 나옵니다. 구글 권한 화면이 나오면 캘린더 일정을 보고 수정하는 항목은 꼭, 공유 달력에 넣으려면 캘린더 목록을 보는 항목도 체크해 주세요.';
     $('calendar-allow').hidden = !signed || !!calendars;
   }
   function savedChoices() { const v = readStorage(CALENDAR_KEY); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }
@@ -192,7 +199,7 @@
   // Without the list (permission left unticked, or reading failed) only the primary calendar and the P-002 ids are used.
   async function loadCalendars() {
     calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = '';
-    if (!listGranted) { calendarNote = '내 기본 달력에만 넣습니다. 공유 달력에 넣으려면 아래 단추를 눌러 달력 목록 보기를 허용해 주세요.'; return; }
+    if (!listGranted) { calendarNote = '내 기본 달력에만 넣습니다. 공유 달력에 넣으려면 아래 단추를 눌러 캘린더 목록을 보는 항목도 허용해 주세요.'; return; }
     try {
       const items = await googleCal.listCalendars(), primary = items.find(c => c.primary);
       if (!primary || !primary.id) throw new Error('no primary calendar in the list');
@@ -260,14 +267,16 @@
     const label = { test: '시험', added: '넣음', exists: '이미 있어 건너뜀', failed: `실패: ${result.message || ''}`, pending: '대기' }[result.status];
     result.li.textContent = `${result.evt.label} · ${result.evt.summary} · ${E.COLORS[result.evt.color].label} — ${label}`;
   }
-  async function signIn(consent = false) {
-    const response = await googleCal.signIn({ consent });
-    accountLabel = response.label; listGranted = response.listGranted;
+  async function signIn(consent = false, hint = '') {
+    const response = await googleCal.signIn({ consent, hint });
+    accountLabel = response.label; listGranted = response.listGranted; $('login-error').hidden = true;
+    connection();  // signed in: show it now, the calendar list may take a moment
     await loadCalendars(); connection();
   }
-  function summarize(authStopped, where) {
+  function summarize(authStopped, where, signInFailed) {
     const count = status => results.filter(r => r.status === status).length;
     $('add-summary').textContent = authStopped ? "로그인이 끝나 멈췄습니다. '실패한 것만 다시'를 누르면 다시 로그인한 뒤 남은 것만 넣습니다." :
+      signInFailed ? `${where}: ${results.length}개 모두 넣지 않았습니다.` :
       `${where}: ${results.length}개 중 ` + [[count('added'), '개 넣음'], [count('exists'), '개는 이미 있어 건너뜀'], [count('failed'), '개 실패']].filter(([n]) => n).map(([n, s]) => n + s).join(', ');
     $('retry-failed').hidden = !count('failed'); $('retry-failed').disabled = false;
     $('open-calendar').hidden = !(count('added') || count('exists'));
@@ -297,16 +306,18 @@
     }
     // the target on screen when pressing; a retry keeps its own run's target (P-009 Codex review 1)
     const pressed = retry && batch ? batch : { calendarId: chosen, ownerKey };
+    const couldChoose = !!calendars && calendars.length > 0;
     busy = true; runError = ''; $('add-summary').textContent = ''; $('retry-failed').hidden = true; render();
-    let authStopped = false, moved = false;
+    let authStopped = false, moved = false, signInFailed = false;
     const queue = results.filter(r => retry ? r.status === 'failed' : true);
     try {
       // signIn is called before the first await, preserving the user's click.
       if (!googleCal.isSignedIn()) {
         await signIn();
-        // signing in can bring back a calendar remembered for this account, or another account:
-        // nothing goes to a target the person did not see when pressing
-        moved = movedFrom(pressed); renderCalendarField();
+        // signing in can bring back a calendar remembered for this account, another account, or calendars to
+        // choose from that were not on screen when pressing: nothing goes in before the person has seen them
+        moved = movedFrom(pressed) || (!retry && !couldChoose && !!calendars && calendars.length > 0);
+        renderCalendarField();
       }
       if (!moved) {
         if (!batch) batch = { calendarId: chosen, calendarName: targetText(chosen), ownerKey };
@@ -324,15 +335,21 @@
         }
       }
     } catch (err) {
-      for (const r of queue) { r.status = 'failed'; r.message = err.message; updateResult(r); }
-      authStopped = err.code === 'auth';
-      runError = err.message;
+      // signing in (or its permissions) failed, so nothing was sent: the reason is said once by the button
+      for (const r of queue) { r.status = 'failed'; r.message = '넣지 않음'; updateResult(r); }
+      authStopped = err.code === 'auth'; signInFailed = !authStopped;
+      runError = explain(err, 'add');
     } finally {
       busy = false;
       if (moved) {
-        clearResults(); runError = `넣을 달력이 ${targetText(chosen)}으로 바뀌었습니다. 넣을 달력을 확인한 뒤 다시 눌러 주세요.`; render();
+        const changed = chosen !== pressed.calendarId;
+        clearResults();
+        runError = changed ? `넣을 달력이 ${targetText(chosen)}으로 바뀌었습니다. 넣을 달력을 확인한 뒤 다시 눌러 주세요.`
+          : '로그인했습니다. 이제 넣을 달력을 고를 수 있습니다. 넣을 달력을 확인한 뒤 다시 눌러 주세요.';
+        runInfo = true;  // a notice, not an error: nothing failed
+        render();
       } else {
-        render(); summarize(authStopped, batch ? batch.calendarName : targetText(pressed.calendarId)); $('progress').textContent = '';
+        render(); summarize(authStopped, batch ? batch.calendarName : targetText(pressed.calendarId), signInFailed); $('progress').textContent = '';
       }
       $('add-summary').scrollIntoView({ block: 'nearest' });
     }
@@ -351,11 +368,11 @@
   };
   $('login-button').onclick = async () => {
     if (busy || reading) return;
-    busy = true; render();
+    busy = true; $('login-error').hidden = true; render();
     try {
       await signIn(); $('status').textContent = '구글 달력에 연결했습니다.';
       if (batch && movedFrom(batch)) clearResults();  // another account or calendar: the old run cannot be retried
-    } catch (err) { $('status').textContent = err.message; }
+    } catch (err) { $('login-error').textContent = explain(err, 'login'); $('login-error').hidden = false; }  // next to the button pressed
     finally { busy = false; render(); }
   };
   $('logout-button').onclick = async () => {
@@ -363,7 +380,8 @@
     busy = true; render();
     try { await googleCal.signOut(); accountLabel = ''; }
     finally {
-      listGranted = false; calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = ''; clearResults();
+      listGranted = false; calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = ''; clearResults(); $('login-error').hidden = true;
+      $('status').textContent = '로그아웃했습니다.';
       busy = false; render();
     }
   };
@@ -377,7 +395,8 @@
     busy = true; render();
     try {
       // the list permission was left unticked: ask again from this click; it was given but reading failed: read again
-      if (listGranted && googleCal.isSignedIn()) await loadCalendars(); else await signIn(true);
+      if (listGranted && googleCal.isSignedIn()) await loadCalendars();
+      else await signIn(true, /^[^@\s]+@[^@\s]+$/.test(accountLabel) ? accountLabel : '');  // offer the same account
       if (batch && movedFrom(batch)) clearResults();
     } catch (err) { calendarNote = `${err.message} 지금은 내 기본 달력에만 넣습니다.`; }
     finally { busy = false; render(); }

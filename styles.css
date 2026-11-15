@@ -2,7 +2,7 @@
 @media (prefers-color-scheme:dark) { :root:not([data-theme="light"]) { color-scheme:dark; --bg:#101722; --card:#1b2635; --text:#f1f4fa; --muted:#bdc9da; --line:#73859d; --accent:#aac8ff; --on-accent:#102344; --error:#ffaaa5; --notice:#253851; } }
 html[data-theme="dark"] { color-scheme:dark; --bg:#101722; --card:#1b2635; --text:#f1f4fa; --muted:#bdc9da; --line:#73859d; --accent:#aac8ff; --on-accent:#102344; --error:#ffaaa5; --notice:#253851; }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--text); font:1rem/1.65 system-ui,sans-serif; overflow-wrap:anywhere; }
+body { margin:0; background:var(--bg); color:var(--text); font:1rem/1.65 system-ui,sans-serif; word-break:keep-all; overflow-wrap:anywhere; }
 main { max-width:640px; margin:auto; padding:20px 12px 48px; }
 header { padding:8px 4px 20px; } h1 { font-size:1.9rem; margin:0; letter-spacing:-.04em; } h2 { font-size:1.25rem; margin:0 0 12px; }
 p { margin:12px 0; } section { margin:0 0 18px; padding:20px 16px; background:var(--card); border:1px solid var(--line); border-radius:18px; }
@@ -15,7 +15,7 @@ button:hover { filter:brightness(.94); } button:disabled { cursor:default; opaci
 label { display:block; font-weight:650; margin:14px 0 6px; } input,select { width:100%; }
 .toolbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; }
 #mode-badge { font-weight:650; } .notice { background:var(--notice); border-radius:12px; padding:16px; } .notice button { display:block; margin-top:10px; }
-.muted { color:var(--muted); } .error { color:var(--error); font-weight:600; } [aria-invalid="true"] { border:2px solid var(--error); }
+.muted { color:var(--muted); } .error { color:var(--error); font-weight:600; } .error.info { color:var(--accent); } [aria-invalid="true"] { border:2px solid var(--error); }
 .month-fields { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 #calendar-field { padding-bottom:6px; border-bottom:1px solid var(--line); } #calendar-field label { margin-top:0; } #calendar-field button { display:block; width:100%; margin:10px 0; }
 #month-candidates button { margin:4px; } #month-candidates button[aria-pressed="true"] { background:var(--accent); color:var(--on-accent); border-color:var(--accent); font-weight:700; }
