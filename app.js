@@ -1,7 +1,7 @@
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
-  const R = window.CircleRecognizer, E = window.CalendarEvents;
+  const R = window.CircleRecognizer, E = window.CalendarEvents, D = window.CircleDraw;
   const googleCal = window.GoogleCalendar.create({ clientId: window.APP_CONFIG.googleClientId });
   const colors = E.COLOR_ORDER, weekdays = ['일', '월', '화', '수', '목', '금', '토'];
   const STATE_KEY = 'circle-cal-state-v1', RECENT_KEY = 'circle-cal-recent-names-v1', CALENDAR_KEY = 'circle-cal-calendar-v1';
@@ -9,7 +9,7 @@
   const copyCells = cells => Object.fromEntries(colors.map(c => [c, new Set(cells[c])]));
   function fresh() {
     const today = new Date();
-    return { year: today.getFullYear(), month: today.getMonth() + 1, weekStart: 0, cells: emptyCells(), names: { yellow: '', blue: '' }, active: false, sample: false, image: null, analysis: null, detected: null };
+    return { year: today.getFullYear(), month: today.getMonth() + 1, weekStart: 0, cells: emptyCells(), names: { yellow: '', blue: '' }, source: null, active: false, sample: false, image: null, analysis: null, detected: null };
   }
   let state = fresh(), results = [], busy = false, reading = false, accountLabel = '', validationShown = false, photoSequence = 0;
   // P-009 calendar choice: calendars = writable calendars from the list (null = not read), ownerKey = person key
@@ -20,6 +20,11 @@
   let view = { year: 0, month: 0, items: [], state: 'signed-out', note: '로그인하면 내 달력이 보입니다.', seq: 0, picked: 0 }, justAdded = { calendarId: '', ids: new Set() };
   let undoOpen = false;  // the '방금 넣은 일정 지우기' confirmation is showing
   let primaryId = '', primaryColor = '', viewDue = false;
+  let drawing = false, pen = colors[0], stroke = null, viewDeferred = false, suppressClickUntil = 0;
+  const cancelledPointers = new Set();
+  let selectionVersion = 0, pendingSelection = null, drawHistory = [];
+  let conflictClickUntil = 0, conflictGuardTimer;
+  const viewLegend = $('view-legend').textContent;
   // Google Calendar's eleven event colours as the web shows them (colorId -> colour)
   const PALETTE = { 1: '#7986cb', 2: '#33b679', 3: '#8e24aa', 4: '#e67c73', 5: '#f6bf26', 6: '#f4511e', 7: '#039be5', 8: '#616161', 9: '#3f51b5', 10: '#0b8043', 11: '#d50000' };
   // the permission message says which button brings the permission screen back, by the button that was pressed
@@ -32,8 +37,8 @@
     const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (className) n.className = className; return n;
   }
   function save() {
-    if (!state.active || state.sample) return;
-    writeStorage(STATE_KEY, { year: state.year, month: state.month, weekStart: state.weekStart,
+    if (state.sample) return;
+    writeStorage(STATE_KEY, { year: state.year, month: state.month, weekStart: state.weekStart, source: state.source,
       cells: Object.fromEntries(colors.map(c => [c, [...state.cells[c]]])), names: state.names, savedAt: Date.now() });
   }
   function days() {
@@ -42,6 +47,253 @@
     }).filter(d => d !== null).sort((a, b) => a - b)]));
   }
   function inputData() { return { year: state.year, month: state.month, days: days(), names: state.names }; }
+  // ---- P-013: one selection transaction for gestures, keyboard, clear and undo ----
+  const selectionCount = () => Object.values(days()).reduce((n, list) => n + list.length, 0);
+  const viewWeekStart = () => state.active && !state.sample ? state.weekStart : 0;
+  function dayKey(day, year = state.year, month = state.month, weekStart = state.weekStart) {
+    const k = R.firstColumn(year, month, weekStart) + day - 1;
+    return `${Math.floor(k / 7)}:${k % 7}`;
+  }
+  function focusDay(day) { $('view-grid').querySelector(`[data-day="${day}"]`)?.focus({ preventScroll: true }); }
+  function closeConflict() {
+    const old = pendingSelection;
+    const hadFocus = $('draw-conflict').contains(document.activeElement);
+    pendingSelection = null; $('draw-conflict').hidden = true;
+    clearTimeout(conflictGuardTimer); delete $('draw-conflict').dataset.pointerGuard;
+    if (hadFocus && old) focusDay(old.days[0]);
+  }
+  function selectionBoundary(clearHistory = false) {
+    cancelStroke(false); closeConflict(); selectionVersion++;
+    if (clearHistory) drawHistory = [];
+  }
+  function selectionSnapshot() {
+    return { year: state.year, month: state.month, weekStart: state.weekStart, cells: copyCells(state.cells),
+      source: state.source, active: state.active, image: state.image, analysis: state.analysis, detected: state.detected };
+  }
+  function selectionChange(kind, selectedDays) {
+    return { kind, days: selectedDays, color: pen, year: view.year, month: view.month, weekStart: viewWeekStart(), version: selectionVersion };
+  }
+  function selectionDates(snapshot) {
+    const dates = new Map();
+    for (const c of colors) for (const key of snapshot.cells[c]) {
+      const [r, col] = key.split(':').map(Number);
+      const day = R.cellDate(r, col, snapshot.year, snapshot.month, snapshot.weekStart);
+      if (day !== null) dates.set(`${snapshot.year}-${snapshot.month}-${day}`, { month: snapshot.month, day, color: c });
+    }
+    return dates;
+  }
+  function applySelection(change, replace = false) {
+    if (busy || reading || !viewShown() || !googleCal.isSignedIn()) return;
+    if (change.version !== undefined && change.version !== selectionVersion) return;
+    if (change.kind === 'undo') {
+      const previous = drawHistory.pop(); if (!previous) return;
+      const before = selectionDates(state), after = selectionDates(previous);
+      const changedDates = [...new Set([...before.keys(), ...after.keys()])].filter(key => before.get(key)?.color !== after.get(key)?.color);
+      let action = `고른 날짜 ${changedDates.length}개를 되돌렸습니다`;
+      if (changedDates.length === 1) {
+        const key = changedDates[0], restored = after.get(key), day = restored || before.get(key);
+        action = `${day.month}월 ${day.day}일 ${E.COLORS[day.color].label}을 ${restored ? '다시 골랐습니다' : '풀었습니다'}`;
+      }
+      const moved = view.year !== previous.year || view.month !== previous.month;
+      selectionBoundary(); Object.assign(state, previous); setViewMonth(state.year, state.month);
+      changed();
+      const selected = days();
+      $('draw-status').textContent = `${action}. 지금 고른 날짜: ${state.year}년 ${state.month}월 ${colors.map(c => E.COLORS[c].label + ' ' + selected[c].length).join('·')}`;
+      if (moved) loadView();
+      $('draw-undo').focus({ preventScroll: true }); return;
+    }
+    const clearing = change.kind === 'clear';
+    if (clearing && !selectionCount()) return;
+    if (!clearing && !change.days.length) return;
+    const sameMonth = state.year === change.year && state.month === change.month;
+    if (!clearing && !sameMonth && selectionCount() && !replace) {
+      pendingSelection = { ...change, days: [...change.days] };
+      const count = selectionCount();
+      $('conflict-note').textContent = `지금 고른 ${state.year}년 ${state.month}월 날짜 ${count}개가 있습니다. 이미 넣은 일정은 달력에 그대로 남습니다.`;
+      const canUndo = !$('undo-run').hidden;
+      $('conflict-undo-note').hidden = !canUndo;
+      $('conflict-undo-note').textContent = canUndo ? `방금 넣은 일정을 지우려면 먼저 ${$('undo-run').textContent}를 누르세요.` : '';
+      $('conflict-undo').hidden = !canUndo;
+      $('conflict-undo').textContent = $('undo-run').textContent;
+      $('conflict-replace').textContent = `고른 표시 ${count}개 풀고 ${change.month}월에 고르기`;
+      $('conflict-go').textContent = `${state.month}월로 가기`;
+      $('draw-conflict').hidden = false;
+      conflictClickUntil = performance.now() + 400;
+      $('draw-conflict').dataset.pointerGuard = 'true';
+      clearTimeout(conflictGuardTimer);
+      conflictGuardTimer = setTimeout(() => { delete $('draw-conflict').dataset.pointerGuard; }, 400);
+      $('draw-conflict').scrollIntoView({ block: 'nearest' });
+      $('conflict-replace').focus({ preventScroll: true }); return;
+    }
+    drawHistory.push(selectionSnapshot()); if (drawHistory.length > 30) drawHistory.shift();
+    closeConflict();
+    if (replace) {
+      validationShown = false;
+      for (const c of colors) { state.names[c] = ''; $('name-' + c).value = ''; }
+    }
+    let removed = false;
+    if (clearing) state.cells = emptyCells();
+    else {
+      if (!sameMonth || !state.active) {
+        state.cells = emptyCells(); state.image = null; state.analysis = null; state.detected = null; state.source = 'drawn';
+        state.year = change.year; state.month = change.month; state.weekStart = change.weekStart;
+      }
+      state.source ||= 'drawn'; state.active = true;
+      for (const day of change.days) {
+        const key = dayKey(day);
+        const toggleOff = change.kind === 'tap' && state.cells[change.color].has(key);
+        for (const c of colors) state.cells[c].delete(key);
+        if (!toggleOff) state.cells[change.color].add(key); else removed = true;
+      }
+    }
+    changed();
+    const label = change.days?.length === 1 ? `${state.month}월 ${change.days[0]}일을`
+      : `${state.month}월 ${change.days?.join('·')}일 ${change.days?.length}개를`;
+    let existing = '';
+    if (!clearing && !removed) {
+      if (change.days.length === 1) {
+        const items = view.items.filter(it => it.days.includes(change.days[0]));
+        if (items.length) existing = `(그날 일정: ${items.slice(0, 2).map(it => E.cleanName(it.ev.summary) || '(제목 없음)').join('·')}${items.length > 2 ? ` 외 ${items.length - 2}개` : ''})`;
+      } else {
+        const count = change.days.filter(day => view.items.some(it => it.days.includes(day))).length;
+        if (count) existing = `, 그중 일정이 있는 날 ${count}일`;
+      }
+    }
+    $('draw-status').textContent = clearing ? '고른 표시를 모두 풀었습니다. 넣을 날짜가 없습니다.'
+      : `${label} ${removed ? '풀었습니다' : E.COLORS[change.color].label + '으로 골랐습니다'}${existing}.`;
+    if (!clearing) focusDay(change.days[0]);
+  }
+  function renderDraw() {
+    const available = viewShown() && googleCal.isSignedIn() && view.state !== 'signed-out';
+    if (!available) { drawing = false; cancelStroke(false); closeConflict(); }
+    if (!available) $('draw-status').textContent = '';
+    $('draw-toggle').hidden = !available; $('draw-toggle').disabled = busy || reading;
+    $('draw-toggle').setAttribute('aria-pressed', String(drawing));
+    $('draw-tools').hidden = !drawing; $('view-board').classList.toggle('drawing', drawing);
+    $('draw-canvas').hidden = !drawing;
+    for (const c of colors) {
+      $('pen-' + c).textContent = `${c === pen ? '✓ ' : ''}${E.COLORS[c].label} 펜`;
+      $('pen-' + c).setAttribute('aria-pressed', String(c === pen)); $('pen-' + c).disabled = busy || reading;
+    }
+    for (const id of ['draw-undo', 'draw-clear', 'draw-to-names', 'conflict-replace', 'conflict-go', 'conflict-undo']) $(id).disabled = busy || reading;
+    // Keep the undo button focusable after the last undo; its empty action is a no-op.
+    $('draw-undo').setAttribute('aria-disabled', String(!drawHistory.length || busy || reading));
+    $('draw-clear').setAttribute('aria-disabled', String(!selectionCount() || busy || reading));
+    $('draw-to-names').disabled ||= !state.active;
+    $('view-grid').setAttribute('aria-label', drawing ? `날짜 고르기, 펜 ${E.COLORS[pen].label}` : '이 달의 날짜와 일정 수');
+    $('view-legend').textContent = drawing ? `날짜 고르기: ${E.COLORS[pen].label} 펜으로 둘러 그리거나 날짜를 누르세요. 고른 색과 같으면 풀립니다. 점은 기존 일정입니다.` : viewLegend + ' 노랑·파랑 테두리는 고른 날짜(아직 넣기 전이거나 이번 묶음)입니다.';
+  }
+  function cancelStroke(repaint = true, completed = false) {
+    const old = stroke; stroke = null;
+    if (old && !completed) cancelledPointers.add(old.id);
+    if (old && $('view-grid').hasPointerCapture(old.id)) $('view-grid').releasePointerCapture(old.id);
+    const canvas = $('draw-canvas'); canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    if (repaint && viewDeferred) { viewDeferred = false; renderView(); }
+  }
+  function drawStroke() {
+    if (!stroke) return;
+    const ctx = $('draw-canvas').getContext('2d'), p = stroke.points;
+    ctx.clearRect(0, 0, stroke.rect.width, stroke.rect.height);
+    ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = stroke.change.color === 'yellow' ? '#a07800' : '#2879db';
+    ctx.beginPath(); ctx.moveTo(p[0].x, p[0].y);
+    for (const point of p.slice(1)) ctx.lineTo(point.x, point.y);
+    ctx.stroke();
+  }
+  for (const c of colors) {
+    const b = node('button', `${E.COLORS[c].label} 펜`); b.id = 'pen-' + c; b.type = 'button'; b.dataset.pen = c;
+    b.onclick = () => { if (busy || reading) return; cancelStroke(); pen = c; renderView(); };
+    $('draw-pens').append(b);
+  }
+  $('draw-toggle').onclick = () => {
+    if (busy || reading || !viewShown() || !googleCal.isSignedIn()) return;
+    cancelStroke(false); closeConflict(); drawing = !drawing; view.picked = 0;
+    if (!drawing) $('draw-status').textContent = '';
+    renderView();
+  };
+  $('draw-undo').onclick = () => applySelection({ kind: 'undo' });
+  $('draw-clear').onclick = () => applySelection({ kind: 'clear' });
+  $('draw-to-names').onclick = () => {
+    const selected = days(), relevant = colors.filter(c => selected[c].length);
+    const c = relevant.find(c => !E.cleanName(state.names[c])) || relevant[0] || colors[0];
+    $('name-' + c).focus();
+  };
+  $('conflict-replace').onclick = () => {
+    const change = pendingSelection;
+    if (change && change.year === view.year && change.month === view.month && change.weekStart === viewWeekStart()) applySelection(change, true);
+  };
+  $('conflict-go').onclick = () => {
+    if (busy || reading || !pendingSelection) return;
+    const first = Math.min(...Object.values(days()).flat());
+    setViewMonth(state.year, state.month); loadView(); focusDay(first);
+  };
+  $('conflict-undo').onclick = () => {
+    if (busy || reading || !pendingSelection || $('undo-run').hidden) return;
+    closeConflict(); $('undo-run').click();
+  };
+  // Ignore the next physical tap while the question moves under the pointer.
+  // Native keyboard activation has detail 0 and remains available immediately.
+  $('draw-conflict').addEventListener('click', event => {
+    if (event.detail >= 1 && performance.now() < conflictClickUntil) {
+      event.preventDefault(); event.stopImmediatePropagation();
+    }
+  }, true);
+  const grid = $('view-grid');
+  // Capture stays on the stable grid, never on a date button replaced by a render.
+  document.addEventListener('pointerdown', event => {
+    if (!stroke) suppressClickUntil = 0;
+    else if (event.pointerId !== stroke.id) { suppressClickUntil = performance.now() + 700; cancelStroke(); }
+  }, true);
+  // A discarded gesture can end much later (e.g. a second finger held down).
+  // Suppress its own eventual pointer click without swallowing keyboard clicks.
+  for (const type of ['pointerup', 'pointercancel']) document.addEventListener(type, event => {
+    if (cancelledPointers.delete(event.pointerId)) suppressClickUntil = performance.now() + 700;
+  }, true);
+  grid.addEventListener('pointerdown', event => {
+    if (pendingSelection) { event.preventDefault(); return; }
+    if (!drawing || busy || reading || !googleCal.isSignedIn() || !event.isPrimary || event.button !== 0) return;
+    cancelledPointers.delete(event.pointerId);
+    const rect = $('view-board').getBoundingClientRect();
+    const cells = [...grid.querySelectorAll('button[data-day]')].map(b => {
+      const r = b.getBoundingClientRect(); return { day: Number(b.dataset.day), x: r.x - rect.x, y: r.y - rect.y, w: r.width, h: r.height };
+    });
+    const canvas = $('draw-canvas'), ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.round(rect.width * ratio); canvas.height = Math.round(rect.height * ratio);
+    canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
+    stroke = { id: event.pointerId, rect, cells, points: [{ x: event.clientX - rect.x, y: event.clientY - rect.y }], change: selectionChange('loop', []) };
+    grid.setPointerCapture(event.pointerId); event.preventDefault();
+  });
+  grid.addEventListener('pointermove', event => {
+    if (!stroke || stroke.id !== event.pointerId) return;
+    stroke.points.push({ x: event.clientX - stroke.rect.x, y: event.clientY - stroke.rect.y }); drawStroke();
+  });
+  grid.addEventListener('pointerup', event => {
+    if (!stroke || stroke.id !== event.pointerId) return;
+    const s = stroke; s.points.push({ x: event.clientX - s.rect.x, y: event.clientY - s.rect.y });
+    const judged = D.classify(s.points);
+    suppressClickUntil = performance.now() + 700; cancelStroke(false, true);
+    let selected = [];
+    if (judged.kind === 'tap') {
+      const day = D.centerDay({ ...s.points[0], w: 0, h: 0 }, s.cells); if (day !== null) selected = [day];
+    } else if (judged.kind === 'loop') {
+      selected = D.daysInside(s.points, s.cells);
+      if (!selected.length) { const day = D.centerDay(judged.bbox, s.cells); if (day !== null) selected = [day]; }
+    }
+    if (selected.length) applySelection({ ...s.change, kind: judged.kind, days: selected });
+    else $('draw-status').textContent = '선만 그어서는 고르지 않습니다. 날짜를 동그라미로 둘러 그리거나 날짜를 누르세요.';
+    if (viewDeferred) { viewDeferred = false; renderView(); }
+  });
+  for (const type of ['pointercancel', 'lostpointercapture']) grid.addEventListener(type, event => {
+    if (stroke?.id === event.pointerId) { suppressClickUntil = performance.now() + 700; cancelStroke(); }
+    if (type === 'pointercancel') cancelledPointers.delete(event.pointerId);
+  });
+  grid.addEventListener('click', event => {
+    if (pendingSelection || (event.detail >= 1 && performance.now() < suppressClickUntil)) {
+      suppressClickUntil = 0; event.preventDefault(); event.stopImmediatePropagation();
+    }
+  }, true);
+  window.addEventListener('resize', () => cancelStroke());
+  window.addEventListener('orientationchange', () => cancelStroke());
   function testMode() { return !googleCal.configured || state.sample; }
   function connection() {
     const signed = googleCal.isSignedIn();
@@ -68,7 +320,7 @@
     }
     // a short summary next to the button too, so the press visibly answers
     if (problems.length && problems.every(p => p.field === 'name')) {
-      $('add-error').textContent = `일정 이름이 비어 있습니다. 위 3단계에서 ${problems.map(p => E.COLORS[p.color].label).join('·')} 이름을 넣어 주세요.`;
+      $('add-error').textContent = `일정 이름이 비어 있습니다. 위 ${$('step-check').hidden ? 2 : 3}단계에서 ${problems.map(p => E.COLORS[p.color].label).join('·')} 이름을 넣어 주세요.`;
       $('add-error').hidden = false;
     }
     if (focus && problems.length) (problems[0].color ? $('name-' + problems[0].color) : $('mini-calendar')).focus();
@@ -131,6 +383,8 @@
       b.setAttribute('aria-label', `${day}${mark ? ' ' + mark : ''}, ${state.month}월 ${day}일 ${weekday}요일${mark ? '' : ', 고르지 않음'}`);
       b.disabled = busy || reading;
       b.addEventListener('click', () => {
+        if (busy || reading) return;
+        selectionBoundary(true);
         state.cells.yellow.delete(key); state.cells.blue.delete(key);
         if (color === 'none') state.cells.yellow.add(key); else if (color === 'yellow') state.cells.blue.add(key);
         changed(); $('mini-calendar').querySelector(`[data-day="${day}"]`).focus({ preventScroll: true });
@@ -140,7 +394,11 @@
     cal.replaceChildren(...children);
   }
   function render() {
+    if (busy || reading) { cancelStroke(false); closeConflict(); }
     for (const id of ['step-check', 'step-names', 'step-add']) $(id).hidden = !state.active;
+    $('step-check').hidden = !state.active || state.source === 'drawn';
+    $('step-names').querySelector('h2').textContent = `${$('step-check').hidden ? 2 : 3}. 일정 이름`;
+    $('step-add').querySelector('h2').textContent = `${$('step-check').hidden ? 3 : 4}. 구글 달력에 넣기`;
     connection(); yearOptions();
     const d = days(), events = E.buildEvents(inputData());
     $('result-summary').textContent = `노랑 ${d.yellow.length}일 · 파랑 ${d.blue.length}일을 ${state.analysis ? '찾았습니다' : '골랐습니다'}.`;
@@ -157,7 +415,7 @@
       const [year, month] = ym.split('-').map(Number);
       const b = node('button', `${year}년 ${month}월`); b.type = 'button'; b.dataset.ym = ym; b.disabled = busy || reading;
       b.setAttribute('aria-pressed', String(year === state.year && month === state.month));
-      b.onclick = () => { state.year = year; state.month = month; changed(); }; $('month-candidates').append(b);
+      b.onclick = () => { selectionBoundary(true); state.year = year; state.month = month; changed(); }; $('month-candidates').append(b);
     }
     $('week-start-label').hidden = !!state.analysis?.ok && state.analysis.grid.weekStartSource !== 'default';
     $('restore-detected').hidden = !state.image || !state.detected;
@@ -193,7 +451,7 @@
     select.value = chosen;
     select.disabled = busy || reading || !signed || !calendars;
     // each person's events go in separately (D-013): say so, so two same-looking events are not taken for a mistake
-    const sharedHint = chosen === 'primary' ? '' : ' 공유 달력에는 넣은 사람마다 따로 들어갑니다. 누구 일정인지 보이게 이름에 사람을 넣어 주세요(예: 엄마 근무).';
+    const sharedHint = chosen === 'primary' ? '' : ' 같은 날·같은 이름이라도 넣은 사람마다 따로 들어갑니다(서로 덮어쓰지 않음). 누구 일정인지 보이게 이름에 사람을 넣어 주세요(예: 엄마 근무).';
     $('calendar-note').textContent = signed ? calendarNote + sharedHint
       : '로그인하면 넣을 달력을 고를 수 있고, 전에 고른 달력도 다시 나옵니다. 구글 권한 화면이 나오면 캘린더 일정을 보고 수정하는 항목은 꼭, 공유 달력에 넣으려면 캘린더 목록을 보는 항목도 체크해 주세요.';
     $('calendar-allow').hidden = !signed || !!calendars;
@@ -254,7 +512,11 @@
     return out;
   }
   function viewShown() { return googleCal.configured && !state.sample; }
-  function setViewMonth(year, month) { view.year = year; view.month = month; view.picked = 0; }
+  function setViewMonth(year, month) {
+    cancelStroke(false); closeConflict();
+    if (view.year !== year || view.month !== month) $('draw-status').textContent = '';
+    view.year = year; view.month = month; view.picked = 0;
+  }
   // forget what is on screen at once (another calendar, account or the example): a late answer cannot come back
   function dropView(stateName, note) { view.seq++; view.items = []; view.state = stateName; view.note = note || ''; view.picked = 0; }
   function viewFailure(err) {
@@ -266,7 +528,7 @@
   async function loadView() {
     if (!viewShown()) return;
     if (!googleCal.isSignedIn()) { dropView('signed-out', '로그인하면 내 달력이 보입니다.'); renderView(); return; }
-    dropView('loading', `${targetText(chosen)}을 읽는 중…`);
+    dropView('loading', '읽는 중…');
     const key = { seq: view.seq, gen: googleCal.generation(), calendarId: chosen, year: view.year, month: view.month };
     renderView();
     // two days either side, filtered by date below: an all-day event of a calendar in another time zone is not lost
@@ -311,18 +573,23 @@
     return { isNew, text: `${when} · ${E.cleanName(ev.summary) || '(제목 없음)'}${isNew ? ' · 방금 넣음' : ''}` };
   }
   function renderView() {
+    if (stroke) { viewDeferred = true; return; }
+    viewDeferred = false;
+    const focusedDay = drawing && document.activeElement.closest?.('#view-grid') ? Number(document.activeElement.dataset.day) : 0;
+    renderDraw();
     const show = viewShown();
     $('my-calendar').hidden = !show;
     if (!show) return;
     if (!view.year) setViewMonth(state.active && !state.sample ? state.year : new Date().getFullYear(), state.active && !state.sample ? state.month : new Date().getMonth() + 1);
     $('my-calendar').dataset.state = view.state;
     $('view-title').textContent = `${view.year}년 ${view.month}월 · ${calendarName(chosen)}`;
-    $('view-note').textContent = view.note; $('view-note').hidden = !view.note;
+    $('view-note').textContent = view.note;
     $('view-retry').hidden = !['error', 'partial'].includes(view.state);
     $('view-open').href = E.monthUrl(view.year, view.month);
     for (const id of ['view-prev', 'view-next', 'view-today']) $(id).disabled = view.state === 'signed-out';
     // before signing in an empty month would read as 'no events': only the guidance shows
-    $('view-grid').hidden = $('view-list').hidden = $('view-legend').hidden = view.state === 'signed-out';
+    $('view-grid').hidden = $('view-legend').hidden = view.state === 'signed-out';
+    $('view-list').hidden = view.state === 'signed-out';
     const counts = {}, byDay = {};
     for (const it of view.items) for (const d of it.days) { counts[d] = (counts[d] || 0) + 1; (byDay[d] = byDay[d] || []).push(it); }
     const weekStart = state.active && !state.sample ? state.weekStart : 0, cells = [];
@@ -332,14 +599,19 @@
     for (let d = 1; d <= R.daysInMonth(view.year, view.month); d++) {
       const n = counts[d] || 0, b = node('button'); b.type = 'button'; b.dataset.day = d; b.dataset.count = n;
       const weekday = weekdays[new Date(Date.UTC(view.year, view.month - 1, d)).getUTCDay()];
-      b.setAttribute('aria-label', `${d}, ${view.month}월 ${d}일 ${weekday}요일, 일정 ${n}개`);  // starts with the visible text (WCAG 2.5.3)
+      const pickedColor = state.active && state.year === view.year && state.month === view.month
+        ? colors.find(c => state.cells[c].has(dayKey(d))) : null;
+      const pickLabel = pickedColor ? E.COLORS[pickedColor].label : '';
+      if (pickedColor) b.dataset.pick = pickedColor;
+      b.setAttribute('aria-label', `${d}${pickLabel ? ' ' + pickLabel : ''}, ${view.month}월 ${d}일 ${weekday}요일, 일정 ${n}개`);
       if (`${view.year}-${pad2(view.month)}-${pad2(d)}` === today) b.classList.add('today');
       const marks = node('span', undefined, 'marks'); marks.setAttribute('aria-hidden', 'true');
       for (const it of (byDay[d] || []).slice(0, 3)) { const dot = node('span', undefined, 'dot'); dot.style.background = colorOf(it.ev); marks.append(dot); }
       if (n > 3) marks.append(node('span', `+${n - 3}`, 'more'));
-      b.append(node('span', d), marks);
-      b.setAttribute('aria-pressed', String(view.picked === d)); b.classList.toggle('picked', view.picked === d);
+      b.append(node('span', d), document.createTextNode(' '), node('small', pickLabel, 'pick-label'), marks);
+      b.setAttribute('aria-pressed', String(drawing ? !!pickedColor : view.picked === d)); b.classList.toggle('picked', !drawing && view.picked === d);
       b.onclick = () => {  // a picked day shows its events only; pressing it again shows the whole month
+        if (drawing) { applySelection(selectionChange('tap', [d])); return; }
         view.picked = view.picked === d ? 0 : d; renderView();
         const li = $('view-list').querySelector('li[data-id]');
         if (view.picked && li) { li.focus(); li.scrollIntoView({ block: 'nearest' }); }
@@ -348,8 +620,8 @@
       cells.push(b);
     }
     $('view-grid').replaceChildren(...cells);
-    const shown = view.picked ? view.items.filter(it => it.days.includes(view.picked)) : view.items;
-    $('view-day-title').hidden = $('view-all').hidden = !view.picked;
+    const shown = !drawing && view.picked ? view.items.filter(it => it.days.includes(view.picked)) : view.items;
+    $('view-day-title').hidden = $('view-all').hidden = drawing || !view.picked;
     if (view.picked) {
       const iso = `${view.year}-${pad2(view.month)}-${pad2(view.picked)}`;
       $('view-day-title').textContent = shown.length ? `${dayText(iso)} 일정 ${shown.length}개` : `${dayText(iso)}에는 일정이 없습니다.`;
@@ -366,6 +638,7 @@
       }
       return li;
     }));
+    if (focusedDay) focusDay(focusedDay);
   }
   // ---- '방금 넣은 일정 지우기': only what this run added, after one confirmation (SOP-014 evaluators C, D) ----
   function renderUndo() {
@@ -439,7 +712,7 @@
   }
   // the target moved away from the one a run (or a press) was made for: another calendar or another account
   function movedFrom(target) { return target.calendarId !== chosen || (!!target.ownerKey && target.ownerKey !== ownerKey); }
-  function changed() { clearResults(); save(); render(); }
+  function changed() { selectionVersion++; closeConflict(); clearResults(); save(); render(); }
   function recentNames(add = []) {
     const stored = readStorage(RECENT_KEY), old = Array.isArray(stored) ? stored.filter(v => typeof v === 'string') : [];
     const names = [...new Set([...add, ...old].map(E.cleanName).filter(Boolean))].slice(0, 8);
@@ -448,6 +721,8 @@
   }
   async function loadPhoto(src, sample, objectURL = false) {
     if (busy || reading) { if (objectURL) URL.revokeObjectURL(src); return; }
+    const drawnCount = state.source === 'drawn' ? selectionCount() : 0;
+    selectionBoundary(true);
     const sequence = ++photoSequence, start = Date.now(); let showCheck = false; reading = true; $('status').textContent = '사진을 읽는 중…'; render();
     const timer = setInterval(() => { const seconds = Math.floor((Date.now() - start) / 1000); if (seconds >= 10) $('status').textContent = `사진을 읽는 중… ${seconds}초`; }, 1000);
     try {
@@ -457,7 +732,7 @@
       await new Promise(resolve => setTimeout(resolve, 0));
       const analysis = R.analyzeSource(image, { today: new Date() });
       if (sequence !== photoSequence) return;
-      const next = fresh(); next.names = { ...state.names }; next.active = true; next.sample = sample; next.image = image; next.analysis = analysis;
+      const next = fresh(); next.names = { ...state.names }; next.source = 'photo'; next.active = true; next.sample = sample; next.image = image; next.analysis = analysis;
       if (analysis.ok) {
         next.year = analysis.month.year; next.month = analysis.month.month; next.weekStart = analysis.grid.weekStart;
         for (const c of colors) next.cells[c] = new Set(analysis.marks[c].map(p => `${p.r}:${p.c}`));
@@ -470,6 +745,7 @@
       $('status').textContent = !analysis.ok ? "달력 칸을 찾지 못했습니다. 달력 앱의 '월' 화면 전체를 캡처한 사진인지 확인해 주세요. 아래 2단계 달력에서 날짜를 직접 골라도 됩니다." :
         !colors.some(c => state.cells[c].size) ? '동그라미를 찾지 못했습니다. 노랑·파랑 펜으로 그렸는지 확인하거나, 아래 2단계 달력에서 날짜를 직접 고르세요.'
           : sample ? '예시 사진을 읽었습니다. 아래 2단계에서 확인해 보세요.' : '사진을 읽었습니다. 아래 2단계에서 달과 날짜를 확인해 주세요.';
+      if (drawnCount) $('status').textContent = `그린 날짜 ${drawnCount}개 대신 사진의 날짜로 바꿨습니다. ` + $('status').textContent;
       showCheck = true;
     } catch (_) { $('status').textContent = '사진을 열지 못했습니다. JPG나 PNG 사진을 골라 주세요.'; }
     finally {
@@ -490,6 +766,7 @@
     result.li.textContent = `${result.evt.label} · ${result.evt.summary} · ${E.COLORS[result.evt.color].label} — ${label}`;
   }
   async function signIn(consent = false, hint = '') {
+    selectionBoundary(true); drawing = false;
     const response = await googleCal.signIn({ consent, hint });
     accountLabel = response.label; listGranted = response.listGranted; $('login-error').hidden = true;
     connection();  // signed in: show it now, the calendar list may take a moment
@@ -579,6 +856,9 @@
           justAdded = { calendarId: batch.calendarId, ids: new Set(results.filter(r => ['added', 'exists'].includes(r.status) && r.id).map(r => r.id)) };
           setViewMonth(state.year, state.month); loadView();
         }
+        const added = colors.map(c => `${E.COLORS[c].label} ${queue.filter(r => r.status === 'added' && r.evt.color === c).length}`).join('·');
+        const failed = results.filter(r => r.status === 'failed').length;
+        $('draw-status').textContent = `넣었습니다: ${added}${failed ? `. 넣지 못한 ${failed}개는 4단계에서 다시` : ''}`;
       }
       $('add-summary').scrollIntoView({ block: 'center' });  // the result is seen without scrolling (SOP-014 D)
     }
@@ -586,38 +866,42 @@
   $('pick-photo').onclick = () => $('file-input').click();
   $('file-input').onchange = () => { const file = $('file-input').files[0]; if (file) loadPhoto(URL.createObjectURL(file), false, true); $('file-input').value = ''; };
   $('try-sample').onclick = () => loadPhoto('sample-calendar.png', true);
-  for (const [id, field] of [['year-select', 'year'], ['month-select', 'month'], ['week-start-select', 'weekStart']]) $(id).onchange = () => { state[field] = Number($(id).value); changed(); };
+  for (const [id, field] of [['year-select', 'year'], ['month-select', 'month'], ['week-start-select', 'weekStart']]) $(id).onchange = () => { if (busy || reading) return; selectionBoundary(true); state[field] = Number($(id).value); changed(); };
   for (const c of colors) $('name-' + c).oninput = () => { state.names[c] = $('name-' + c).value; changed(); };
-  $('restore-detected').onclick = () => { if (state.detected) { state.cells = copyCells(state.detected.cells); state.weekStart = state.detected.weekStart; changed(); } };
+  $('restore-detected').onclick = () => { if (!busy && !reading && state.detected) { selectionBoundary(true); state.cells = copyCells(state.detected.cells); state.weekStart = state.detected.weekStart; changed(); } };
   $('add-button').onclick = () => add(); $('retry-failed').onclick = () => add(true);
   $('reset-button').onclick = () => {
+    if (busy || reading) return;
+    selectionBoundary(true); drawing = false; $('draw-status').textContent = '';
     try { localStorage.removeItem(STATE_KEY); } catch (_) { /* Optional storage. */ }
     state = fresh(); for (const c of colors) $('name-' + c).value = ''; validationShown = false;
     $('restore-note').hidden = true; $('status').textContent = ''; changed();
   };
   $('login-button').onclick = async () => {
     if (busy || reading) return;
-    busy = true; $('login-error').hidden = true; render();
+    busy = true; $('login-error').hidden = true; $('account-status').textContent = ''; render();
     try {
-      await signIn(); $('status').textContent = '구글 달력에 연결했습니다.';
+      await signIn(); $('account-status').textContent = '구글 달력에 연결했습니다.';
       if (batch && movedFrom(batch)) clearResults();  // another account or calendar: the old run cannot be retried
     } catch (err) { $('login-error').textContent = explain(err, 'login'); $('login-error').hidden = false; }  // next to the button pressed
     finally { busy = false; render(); }
   };
   $('logout-button').onclick = async () => {
     if (busy || reading) return;
+    selectionBoundary(true); drawing = false;
     busy = true; render();
     try { await googleCal.signOut(); accountLabel = ''; }
     finally {
       listGranted = false; calendars = null; ownerKey = ''; chosen = 'primary'; calendarNote = ''; clearResults(); $('login-error').hidden = true;
       primaryId = ''; primaryColor = ''; justAdded = { calendarId: '', ids: new Set() };
       dropView('signed-out', '로그인하면 내 달력이 보입니다.');
-      $('status').textContent = '로그아웃했습니다.';
+      $('account-status').textContent = '로그아웃했습니다.';
       busy = false; render();
     }
   };
   $('calendar-select').onchange = () => {
     if (busy || reading) { render(); return; }
+    selectionBoundary();
     chosen = $('calendar-select').value; rememberChoice(chosen);
     clearResults(); render();  // a run's results and its retry belong to the calendar it was made for
     loadView();  // my calendar follows the choice; the previous calendar's answer is dropped
@@ -690,7 +974,7 @@
     for (const c of colors) if (Array.isArray(saved.cells?.[c])) cells[c] = new Set(saved.cells[c].filter(k => typeof k === 'string' && /^[0-5]:[0-6]$/.test(k)));
     for (const key of cells.yellow) cells.blue.delete(key);
     if (colors.some(c => cells[c].size)) {
-      Object.assign(state, { year: saved.year, month: saved.month, weekStart: saved.weekStart, cells, active: true });
+      Object.assign(state, { year: saved.year, month: saved.month, weekStart: saved.weekStart, cells, active: true, source: saved.source === 'drawn' ? 'drawn' : 'photo' });
       for (const c of colors) state.names[c] = typeof saved.names?.[c] === 'string' ? saved.names[c] : '';
       $('restore-note').hidden = false;
     }
